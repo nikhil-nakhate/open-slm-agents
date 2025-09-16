@@ -1,114 +1,193 @@
-Open SLM Agents — Modular GPT Repo
+<div align="center">
 
-Overview
+# Open SLM Agents — Build small agents from scratch 🚀
 
-- Modular, config‑driven GPT implementations with a model registry (Detectron2/MMDet style).
-- Clean separation of concerns: tokenizer, embeddings, transformer, output head, loss, datasets, logging.
-- Hierarchical YAML configs with overrides via extends, per‑module freeze flags, and trainer settings.
-- Simple trainer with checkpointing/resume, mixed precision, and optional W&B/TensorBoard logging.
-- Interactive evaluation with greedy/sampling decode, and support for loading converted GPT‑2 weights.
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](#) [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c)](#)
 
-Quick Start
+<i>Config‑driven, registry‑based GPT models with clean modularity.</i>
 
-- Install (Python 3.8+):
-  - Base: `pip install -e .`
-  - With optional deps (HF, W&B, TensorBoard): `pip install -e .[all]`
+<sub>
+  <a href="#installation">Installation</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#configuration">Configuration</a> •
+  <a href="#project-structure">Structure</a> •
+  <a href="#datasets--crawlers">Datasets</a> •
+  <a href="#converted-gpt-2-weights">GPT‑2 Weights</a>
+</sub>
 
-- Train:
-  - `python train.py --mode pretraining --config base --logger none`
-  - `python train.py --mode pretraining --config gpt2_base --logger tensorboard`
-  - Resume: `python train.py --mode pretraining --config gpt2_base --resume outputs/gpt2-base/step_200.pt`
+</div>
 
-- Evaluate (interactive REPL):
-  - `python eval.py --config gpt2_base`
-  - With training checkpoint: `--checkpoint outputs/gpt2-base/step_200.pt`
-  - With converted GPT‑2 weights: `--weights_dir weights/gpt2/355M`
-  - Generation settings come from `eval` section in the config.
+## ✨ Features
 
-Project Structure
+- Modular, config‑driven GPT with a Detectron2/MMDet‑style registry
+- Separate builders for tokenizer, embeddings, transformer, projection, loss
+- Hierarchical YAML configs (`extends`) with per‑module freeze flags
+- Trainer with AMP, checkpoints/resume, schedulers, and logging (W&B/TensorBoard)
+- Interactive eval REPL with greedy/sampling decode and GPT‑2 weight loading
 
-- `models/`
-  - `__init__.py` — registry and registration helpers
-  - `meta_arch/gpt.py` — GPT model class (from_config factory)
-  - `modules/` — building blocks and builders
-    - `build.py` — `build_*` helpers for tokenizer, embeddings, transformer, head, loss, norms
-    - `embeddings.py` — `TokenEmbedding`, `PositionEmbedding`, and output projection
-    - `transformer.py` — `TransformerBlock`, `Transformer`
-    - `mha.py` — `MultiHeadAttention`
-    - `layer_norm.py` — LayerNorm module
-    - `losses.py` — loss builders (e.g., cross‑entropy)
+---
 
-- `ops/`
-  - `config.py` — YAML loader with hierarchical extends
-  - `tokenizer.py` — tokenizer base + simple/regex/HF GPT‑2 options
+## 🔧 Installation
 
-- `data/`
-  - `dataset.py` — `BaseDataset`, `TextFileDataset`, and dataset+collate builder via config
+```bash
+# Base install
+pip install -e .
 
-- `metrics/`
-  - `loggers/` — `BaseLogger`, `WandBLogger`, `TensorBoardLogger`
+# With optional dependencies (HF + W&B + TensorBoard)
+pip install -e .[all]
+```
 
-- `configs/`
-  - `base.yaml`, `gpt2_base.yaml`, `gpt2_medium.yaml` — hierarchical, override‑friendly
+Requirements: Python 3.8+, PyTorch 2.0+. Optional: transformers, wandb, tensorboard, tensorflow (for GPT‑2 conversion).
 
-- `scripts/`
-  - `gpt_download3.py` — downloads GPT‑2 TF weights into `weights/gpt2/<size>` and saves converted params
-  - `load_gpt_weights.py` — loads converted GPT‑2 weights into our GPT model
+---
 
-- Top level:
-  - `train.py` — trainer CLI
-  - `eval.py` — interactive generation CLI
+## 🚀 Quick Start
 
-Config Basics
+Train:
+```bash
+python train.py --mode pretraining --config base --logger none
+python train.py --mode pretraining --config gpt2_base --logger tensorboard
 
-- YAML files support `extends` with deep merge.
-- Model section:
-  - `model.name`: model key in the registry (`gpt`)
-  - `model.modules.tokenizer`: tokenizer kind + params
-  - `model.modules.token_embedding`, `position_embedding`, `emb_dropout`
-  - `model.modules.transformer`:
-    - `dim`, `n_layers`, `n_heads`, `mlp_mult`, `activation`, `qkv_bias`, `prenorm`
-    - `context_length` defaults to `model.params.max_seq_len` if omitted
-  - `model.modules.output_projection`: `tie_weights`
-  - `model.modules.loss`: e.g., `kind: cross_entropy`
-  - `model.params`: global params like `max_seq_len`, `dropout` (and inferred `vocab_size`)
+# Resume from checkpoint
+python train.py --mode pretraining --config gpt2_base --resume outputs/gpt2-base/step_200.pt
+```
 
-- Train section:
-  - Optimizer: `lr`, `betas`, `weight_decay`
-  - Loop: `batch_size`, `max_steps`, `log_every`, `save_every`, `amp`
-  - Checkpointing: `output_dir`, `resume`
-  - Scheduler: `scheduler.kind` (linear|cosine|none), `warmup_steps`, `min_lr`
-  - Data loader: `train.data_loader.kind` (e.g., `language_modeling_text`), `block_size`, `shuffle`, workers, etc.
+Evaluate (interactive REPL):
+```bash
+python eval.py --config gpt2_base
+# Optional
+python eval.py --config gpt2_base --checkpoint outputs/gpt2-base/step_200.pt
+python eval.py --config gpt2_base --weights_dir weights/gpt2/355M
+```
 
-- Eval section:
-  - `max_new_tokens`, `temperature`, `top_k`, `top_p`, `greedy`
+Generation settings are read from the `eval` section of your config.
 
-Add a New Model
+---
 
-- Create a class under `models/meta_arch/` and decorate with `@register_model("my_key")`.
-- Implement `@classmethod from_config(cls, cfg)` that extracts config, prepares kwargs, and returns `cls(**kwargs)`.
-- Compose submodules using `models/modules/build.py` helpers. Respect `freeze` flags via builder.
+## 🧩 Configuration
 
-Datasets
+YAML configs support `extends` with deep merge. High‑level layout:
 
-- Default `TextFileDataset` reads `.txt` from `train.data_dir` and chunks into token windows.
-- Crawler for remote JSON datasets (SFT/RL/RAG):
-  - `python crawlers/sample_instruction_data.py --url <http_url> --category sft --filename data.json`
-  - Saved into `data/<category>/filename`.
+```yaml
+model:
+  name: gpt
+  params:
+    max_seq_len: 1024        # context length
+    dropout: 0.1             # global dropout default
+  modules:
+    tokenizer: { kind: hf_gpt2, params: { name: gpt2 } }
+    token_embedding: { freeze: false }
+    position_embedding: { freeze: false }
+    emb_dropout: { p: 0.1 }
+    transformer:
+      dim: 768
+      n_layers: 12
+      n_heads: 12
+      mlp_mult: 4
+      activation: gelu
+      qkv_bias: false
+      prenorm: true
+    output_projection: { tie_weights: true }
+    loss: { kind: cross_entropy, params: { ignore_index: -100 } }
 
-Converted GPT‑2 Weights
+train:
+  lr: 2.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  batch_size: 4
+  max_steps: 1000
+  save_every: 200
+  log_every: 20
+  amp: true
+  output_dir: outputs/gpt2-base
+  scheduler: { kind: cosine, warmup_steps: 100, min_lr: 0.0 }
+  data_loader: { kind: language_modeling_text, block_size: 1024, shuffle: true }
 
-- Download/convert: `python scripts/gpt_download3.py` (saves into `weights/gpt2/<size>`)
-- Eval with converted weights: `python eval.py --config gpt2_base --weights_dir weights/gpt2/355M`
+eval:
+  max_new_tokens: 80
+  temperature: 0.9
+  top_k: 40
+  top_p: 0.0
+  greedy: false
+```
 
-Tips & Troubleshooting
+Notes:
+- `model.modules.transformer.dim/n_layers/n_heads` are the single source of truth.
+- `vocab_size` is inferred from the tokenizer if omitted.
+- Per‑module `freeze: true` is respected at build time (no trainer logic needed).
 
-- Missing YAML support: `pip install pyyaml`
-- HF tokenizer: `pip install transformers` and use `model.modules.tokenizer.kind: hf_gpt2`
-- TensorBoard/W&B: install extras `pip install -e .[tb]` or `[wandb]`
-- TensorFlow is only required for the GPT‑2 download/conversion script.
+---
 
-License
+## 🗂 Project Structure
 
-- See repository license (if provided). If not specified, please clarify your preferred licensing.
+```
+models/
+  __init__.py                 # registry
+  meta_arch/gpt.py            # GPT (from_config)
+  modules/
+    build.py                  # builders (tokenizer/emb/blocks/head/loss/norm)
+    embeddings.py             # TokenEmbedding, PositionEmbedding, OutputProjection
+    transformer.py            # TransformerBlock/Transformer
+    mha.py                    # MultiHeadAttention
+    layer_norm.py             # LayerNorm
+    losses.py                 # loss builders
+ops/
+  config.py                   # YAML loader + extends
+  tokenizer.py                # tokenizers (simple/regex/HF)
+data/
+  dataset.py                  # BaseDataset, TextFileDataset, builder
+metrics/
+  loggers/                    # BaseLogger, WandBLogger, TensorBoardLogger
+configs/
+  base.yaml, gpt2_base.yaml, gpt2_medium.yaml
+scripts/
+  gpt_download3.py            # download + save GPT‑2 params
+  load_gpt_weights.py         # load converted params into our GPT
+train.py                      # trainer CLI
+eval.py                       # interactive eval CLI
+```
 
+---
+
+## 📦 Datasets & Crawlers
+
+- Default `TextFileDataset` consumes `.txt` under `train.data_dir` and chunks to windows.
+- Download remote JSON datasets (SFT/RL/RAG):
+
+```bash
+python crawlers/sample_instruction_data.py \
+  --url https://.../instruction-data.json \
+  --category sft \
+  --filename instruction-data.json
+```
+
+Saved to `data/<category>/<filename>`.
+
+---
+
+## 📥 Converted GPT‑2 Weights
+
+```bash
+# Download + convert
+python scripts/gpt_download3.py
+
+# Evaluate with converted weights
+python eval.py --config gpt2_base --weights_dir weights/gpt2/355M
+```
+
+The loader maps GPT‑2 tensors into our module layout (token/pos embeddings, QKV, MLP, norms, head).
+
+---
+
+## 🛠 Tips & Troubleshooting
+
+- YAML: `pip install pyyaml`
+- HF tokenizer: `pip install transformers`; set `model.modules.tokenizer.kind: hf_gpt2`
+- Logging: `pip install -e .[tb]` or `pip install -e .[wandb]`
+- TensorFlow is only needed for GPT‑2 download/conversion scripts.
+
+---
+
+## 📄 License
+
+Please include your license of choice for this repository.

@@ -64,6 +64,10 @@ train:
     pin_memory: true
     drop_last: false
 
+data:
+  transforms:
+    template: alpaca
+
 eval:
   max_new_tokens: 80
   temperature: 0.9
