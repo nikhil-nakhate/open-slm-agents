@@ -4,22 +4,22 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](#) [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c)](#)
 
-<i>Config‑driven, registry‑based GPT models with clean modularity.</i>
+<i>Config‑driven, registry‑based SLMs (incl. GPT) with clean modularity.</i>
 
 <sub>
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#configuration">Configuration</a> •
   <a href="#project-structure">Structure</a> •
-  <a href="#datasets--crawlers">Datasets</a> •
-  <a href="#converted-gpt-2-weights">GPT‑2 Weights</a>
+  <a href="#datasets-and-crawlers">Datasets</a> •
+  <a href="#converted-gpt-2-weights">GPT-2 Weights</a>
 </sub>
 
 </div>
 
 ## ✨ Features
 
-- Modular, config‑driven GPT with a Detectron2/MMDet‑style registry
+- Modular, config‑driven SLMs
 - Separate builders for tokenizer, embeddings, transformer, projection, loss
 - Hierarchical YAML configs (`extends`) with per‑module freeze flags
 - Trainer with AMP, checkpoints/resume, schedulers, and logging (W&B/TensorBoard)
@@ -27,6 +27,7 @@
 
 ---
 
+<a id="installation"></a>
 ## 🔧 Installation
 
 ```bash
@@ -41,6 +42,7 @@ Requirements: Python 3.8+, PyTorch 2.0+. Optional: transformers, wandb, tensorbo
 
 ---
 
+<a id="quick-start"></a>
 ## 🚀 Quick Start
 
 Train:
@@ -64,6 +66,7 @@ Generation settings are read from the `eval` section of your config.
 
 ---
 
+<a id="configuration"></a>
 ## 🧩 Configuration
 
 YAML configs support `extends` with deep merge. High‑level layout:
@@ -118,6 +121,7 @@ Notes:
 
 ---
 
+<a id="project-structure"></a>
 ## 🗂 Project Structure
 
 ```
@@ -149,6 +153,7 @@ eval.py                       # interactive eval CLI
 
 ---
 
+<a id="datasets-and-crawlers"></a>
 ## 📦 Datasets & Crawlers
 
 - Default `TextFileDataset` consumes `.txt` under `train.data_dir` and chunks to windows.
@@ -165,7 +170,8 @@ Saved to `data/<category>/<filename>`.
 
 ---
 
-## 📥 Converted GPT‑2 Weights
+<a id="converted-gpt-2-weights"></a>
+## 📥 Converted GPT-2 Weights
 
 ```bash
 # Download + convert
