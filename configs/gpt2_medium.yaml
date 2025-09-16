@@ -1,0 +1,16 @@
+extends: gpt2_base
+
+model:
+  name: gpt
+  modules:
+    transformer:
+      dim: 1024           # emb_dim
+      n_layers: 24
+      n_heads: 16
+      qkv_bias: true
+
+train:
+  run_name: gpt2-medium
+  output_dir: outputs/gpt2-medium
+  # Optionally adjust batch size if memory constrained
+  # batch_size: 2

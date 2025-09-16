@@ -1,0 +1,68 @@
+model:
+  name: gpt
+  params:
+    max_seq_len: 256
+    dropout: 0.1
+    # vocab_size can be inferred from tokenizer if omitted
+  modules:
+    tokenizer:
+      kind: simple_char
+      params: {}
+      freeze: false
+    token_embedding:
+      freeze: false
+    position_embedding:
+      freeze: false
+    emb_dropout:
+      p: 0.1
+    transformer:
+      dropout: 0.1
+      mlp_mult: 4
+      activation: gelu
+      dim: 256
+      qkv_bias: false
+      n_layers: 4
+      n_heads: 4
+      prenorm: true
+      freeze: false
+    output_projection:
+      tie_weights: true
+      freeze: false
+    loss:
+      kind: cross_entropy
+      params:
+        ignore_index: -100
+      freeze: false
+
+train:
+  lr: 0.0003
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  batch_size: 8
+  max_steps: 200
+  save_every: 100
+  log_every: 10
+  amp: true
+  data_dir: data
+  output_dir: outputs/base-run
+  project: open-slm
+  log_dir: runs
+  run_name: base
+  scheduler:
+    kind: cosine
+    warmup_steps: 50
+    min_lr: 0.0
+  data_loader:
+    kind: language_modeling_text
+    block_size: 128
+    shuffle: true
+    num_workers: 0
+    pin_memory: true
+    drop_last: false
+
+eval:
+  max_new_tokens: 50
+  temperature: 1.0
+  top_k: 0
+  top_p: 0.0
+  greedy: false
