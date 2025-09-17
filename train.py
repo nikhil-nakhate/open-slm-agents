@@ -1,7 +1,7 @@
 import os
 import argparse
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -70,6 +70,112 @@ def save_checkpoint(state: Dict[str, Any], out_dir: str, step: int):
     return ckpt_path
 
 
+def _merge_dict(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _merge_dict(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def build_dataloader_for_split(cfg: Dict[str, Any], tokenizer, split: str) -> DataLoader:
+    """Builds a DataLoader for a specific split by merging split overrides.
+
+    Supports optional per-split overrides under `train.splits.<split>`:
+      - data_dir
+      - batch_size, shuffle, num_workers, pin_memory, drop_last
+      - data_loader: {...} (merged into base train.data_loader)
+    """
+    base_train = cfg.get("train", {})
+    split_over = base_train.get("splits", {}).get(split, {})
+
+    # Effective train section for this split
+    eff_train: Dict[str, Any] = dict(base_train)
+    if split_over.get("data_dir"):
+        eff_train["data_dir"] = split_over["data_dir"]
+    # Merge data_loader dicts (split overrides base)
+    eff_train["data_loader"] = _merge_dict(base_train.get("data_loader", {}), split_over.get("data_loader", {}))
+
+    # Build dataset + collate using an ephemeral cfg copy
+    eff_cfg = dict(cfg)
+    eff_cfg["train"] = eff_train
+    dataset, collate = build_dataset_and_collate(eff_cfg, tokenizer)
+
+    dl_cfg = eff_train.get("data_loader", {})
+    # Defaults: train shuffles by default; eval/test don't
+    default_shuffle = True if split == "train" else False
+    batch_size = int(split_over.get("batch_size", eff_train.get("batch_size", 8)))
+    shuffle = bool(split_over.get("shuffle", dl_cfg.get("shuffle", default_shuffle)))
+    num_workers = int(split_over.get("num_workers", dl_cfg.get("num_workers", 0)))
+    pin_memory = bool(split_over.get("pin_memory", dl_cfg.get("pin_memory", True)))
+    drop_last = bool(split_over.get("drop_last", dl_cfg.get("drop_last", False)))
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        collate_fn=collate,
+    )
+
+
+def build_dataloaders(cfg: Dict[str, Any], tokenizer) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader]]:
+    """Returns (train_dl, eval_dl, test_dl) with support for ratio-based splitting.
+
+    Two modes:
+    1) Ratio mode: train.splits.ratios.{train,eval,test} define fractions. One dataset is
+       built and split deterministically (seed) across these ratios.
+    2) Per-split mode (fallback): each split can override data_dir and data_loader.
+    """
+    train_cfg = cfg.get("train", {})
+    splits_cfg = train_cfg.get("splits", {})
+
+    ratios = splits_cfg.get("ratios")
+    if isinstance(ratios, dict):
+        # Build the base dataset once
+        dataset, collate = build_dataset_and_collate(cfg, tokenizer)
+        n = len(dataset)
+        r_train = float(ratios.get("train", 0.85))
+        r_eval = float(ratios.get("eval", 0.10))
+        r_test = float(ratios.get("test", 1.0 - (r_train + r_eval)))
+        # Clamp and normalize minimal issues
+        r_test = max(0.0, r_test)
+        n_train = int(n * r_train)
+        n_eval = int(n * r_eval)
+        n_test = max(0, n - n_train - n_eval)
+        g = torch.Generator()
+        g.manual_seed(int(splits_cfg.get("seed", 42)))
+        train_set, eval_set, test_set = torch.utils.data.random_split(dataset, [n_train, n_eval, n_test], generator=g)
+
+        dl_cfg = train_cfg.get("data_loader", {})
+        batch_size = int(train_cfg.get("batch_size", 8))
+        num_workers = int(dl_cfg.get("num_workers", 0))
+        pin_memory = bool(dl_cfg.get("pin_memory", True))
+        drop_last = bool(dl_cfg.get("drop_last", False))
+
+        mk = lambda ds, shuffle: DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+            collate_fn=collate,
+        )
+
+        return mk(train_set, True), mk(eval_set, False), mk(test_set, False)
+
+    # Fallback: per-split config
+    train_dl = build_dataloader_for_split(cfg, tokenizer, split="train")
+    eval_dl = build_dataloader_for_split(cfg, tokenizer, split="eval")
+    test_dl = build_dataloader_for_split(cfg, tokenizer, split="test")
+    return train_dl, eval_dl, test_dl
+
+
 def train_loop(cfg: Dict[str, Any], mode: str, logger_kind: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -83,23 +189,8 @@ def train_loop(cfg: Dict[str, Any], mode: str, logger_kind: str):
     weight_decay = train_cfg.get("weight_decay", 0.1)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
 
-    # Dataset and DataLoader from config
-    dataset, collate = build_dataset_and_collate(cfg, tokenizer)
-    dl_cfg = train_cfg.get("data_loader", {})
-    batch_size = int(train_cfg.get("batch_size", 8))
-    shuffle = bool(dl_cfg.get("shuffle", True))
-    num_workers = int(dl_cfg.get("num_workers", 0))
-    pin_memory = bool(dl_cfg.get("pin_memory", True))
-    drop_last = bool(dl_cfg.get("drop_last", False))
-    dl = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-        collate_fn=collate,
-    )
+    # Build train/eval/test dataloaders
+    train_dl, eval_dl, test_dl = build_dataloaders(cfg, tokenizer)
 
     # Logger and checkpointing
     run_name = train_cfg.get("run_name", f"{cfg.get('model',{}).get('name','model')}-{int(time.time())}")
@@ -136,7 +227,7 @@ def train_loop(cfg: Dict[str, Any], mode: str, logger_kind: str):
     model.train()
     try:
         for epoch in range(10**9):  # run until max_steps
-            for batch in dl:
+            for batch in train_dl:
                 step += 1
                 x = batch["input_ids"].to(device)
                 y = batch["labels"].to(device)

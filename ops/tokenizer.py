@@ -18,8 +18,8 @@ class BaseTokenizer:
 
     @property
     def pad_id(self) -> int:
-        # Default pad id
-        return 0
+        # Reserve the last index for padding
+        return self.vocab_size - 1
 
     @property
     def eos_id(self) -> Optional[int]:
@@ -31,7 +31,7 @@ class SimpleCharTokenizer(BaseTokenizer):
     """A minimal character-level tokenizer as a safe default.
 
     - Builds vocabulary from provided `vocab_chars` or falls back to printable ASCII.
-    - Uses id 0 as padding if needed.
+    - Reserves the last id (vocab_size - 1) as padding.
     """
 
     def __init__(self, vocab_chars: str = None):
@@ -41,24 +41,29 @@ class SimpleCharTokenizer(BaseTokenizer):
             # Basic printable set (excluding control chars)
             vocab_chars = string.printable
         self.itos = list(dict.fromkeys(vocab_chars))
-        # Reserve 0 for padding; start tokens at 1
-        self.stoi = {ch: i + 1 for i, ch in enumerate(self.itos)}
-        self._pad_id = 0
+        # 0-based token ids for characters; last id is reserved for PAD
+        self.stoi = {ch: i for i, ch in enumerate(self.itos)}
 
     def encode(self, text: str) -> List[int]:
-        return [self.stoi.get(ch, self.stoi.get("?", 1)) for ch in text]
+        unk = self.stoi.get("?", 0)
+        return [self.stoi.get(ch, unk) for ch in text]
 
     def decode(self, ids: List[int]) -> str:
-        return "".join(self.itos[i - 1] if i > 0 and i - 1 < len(self.itos) else "?" for i in ids)
+        out = []
+        pad = self.pad_id
+        for i in ids:
+            if i == pad:
+                continue
+            if 0 <= i < len(self.itos):
+                out.append(self.itos[i])
+            else:
+                out.append("?")
+        return "".join(out)
 
     @property
     def vocab_size(self) -> int:
-        # Plus one for pad id 0
+        # +1 slot reserved for PAD at the end
         return len(self.itos) + 1
-
-    @property
-    def pad_id(self) -> int:
-        return self._pad_id
 
     @property
     def eos_id(self) -> Optional[int]:
@@ -72,8 +77,9 @@ class RegexWordTokenizer(BaseTokenizer):
     """
 
     def __init__(self):
-        self.stoi = {"<pad>": 0, "<unk>": 1}
-        self.itos = ["<pad>", "<unk>"]
+        # Do not bake PAD into vocab; reserve last index for PAD
+        self.stoi = {"<unk>": 0}
+        self.itos = ["<unk>"]
         self._word_re = re.compile(r"\w+|[^\w\s]")
 
     def encode(self, text: str) -> List[int]:
@@ -82,16 +88,22 @@ class RegexWordTokenizer(BaseTokenizer):
             if tok not in self.stoi:
                 self.stoi[tok] = len(self.itos)
                 self.itos.append(tok)
-            ids.append(self.stoi.get(tok, 1))
+            ids.append(self.stoi.get(tok, 0))
         return ids
 
     def decode(self, ids: List[int]) -> str:
-        toks = [self.itos[i] if 0 <= i < len(self.itos) else "<unk>" for i in ids]
-        return " ".join(toks).replace(" <pad>", "").strip()
+        toks = []
+        pad = self.pad_id
+        for i in ids:
+            if i == pad:
+                continue
+            toks.append(self.itos[i] if 0 <= i < len(self.itos) else "<unk>")
+        return " ".join(toks).strip()
 
     @property
     def vocab_size(self) -> int:
-        return len(self.itos)
+        # +1 slot reserved for PAD at the end
+        return len(self.itos) + 1
 
 
 def build_tokenizer(cfg: Dict[str, Any]) -> BaseTokenizer:
@@ -135,7 +147,8 @@ class HFTokenizer(BaseTokenizer):
 
     @property
     def pad_id(self) -> int:
-        return getattr(self.tok, "pad_token_id", 0) or 0
+        # Always reserve last id for padding
+        return self.tok.vocab_size - 1
 
     @property
     def eos_id(self) -> Optional[int]:

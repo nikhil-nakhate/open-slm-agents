@@ -99,29 +99,52 @@ class SFTJsonDataset(BaseDataset):
 
 
 def _make_sft_collate(tokenizer, block_size: int, ignore_index: int) -> Callable[[List[Tuple[str, str]]], Dict[str, torch.Tensor]]:
-    pad_id = getattr(tokenizer, "pad_id", 0)
-    eos_id = getattr(tokenizer, "eos_id", None)
+    pad_token_id = getattr(tokenizer, "pad_id", 0)
 
     def collate(batch: List[Tuple[str, str]]) -> Dict[str, torch.Tensor]:
-        input_ids_list: List[List[int]] = []
-        labels_list: List[List[int]] = []
+        # Encode each (prompt, target) into a single sequence of ids
+        sequences: List[List[int]] = []
         for prompt, target in batch:
-            p_ids = tokenizer.encode(prompt)
-            t_ids = tokenizer.encode(target)
-            if eos_id is not None:
-                t_ids = t_ids + [eos_id]
-            ids = (p_ids + t_ids)[: block_size]
-            n_prompt = min(len(p_ids), len(ids))
-            labels = [ignore_index] * n_prompt + ids[n_prompt:]
-            if len(ids) < block_size:
-                pad_len = block_size - len(ids)
-                ids = ids + [pad_id] * pad_len
-                labels = labels + [ignore_index] * pad_len
-            input_ids_list.append(ids)
-            labels_list.append(labels)
-        x = torch.tensor(input_ids_list, dtype=torch.long)
-        y = torch.tensor(labels_list, dtype=torch.long)
-        return {"input_ids": x, "labels": y}
+            ids = tokenizer.encode(prompt) + tokenizer.encode(target)
+            sequences.append(ids)
+
+        # Find the longest sequence length (plus one for added pad/eos token)
+        batch_max_length = max((len(seq) + 1) for seq in sequences) if sequences else 0
+
+        inputs_lst: List[torch.Tensor] = []
+        targets_lst: List[torch.Tensor] = []
+        allowed_max_length = block_size
+
+        for seq in sequences:
+            new_item = list(seq)
+            # Add an <|endoftext|>/pad token at the end
+            new_item += [pad_token_id]
+            # Pad to batch max length
+            pad_len = batch_max_length - len(new_item)
+            if pad_len > 0:
+                new_item = new_item + [pad_token_id] * pad_len
+
+            inputs = torch.tensor(new_item[:-1], dtype=torch.long)
+            targets = torch.tensor(new_item[1:], dtype=torch.long)
+
+            # Replace all but the first padding tokens in targets by ignore_index
+            mask = targets == pad_token_id
+            indices = torch.nonzero(mask).squeeze()
+            if torch.numel(indices) > 1:
+                targets[indices[1:]] = ignore_index
+
+            # Optionally truncate to maximum sequence length
+            if allowed_max_length is not None:
+                inputs = inputs[:allowed_max_length]
+                targets = targets[:allowed_max_length]
+
+            inputs_lst.append(inputs)
+            targets_lst.append(targets)
+
+        inputs_tensor = torch.stack(inputs_lst) if inputs_lst else torch.empty(0, dtype=torch.long)
+        targets_tensor = torch.stack(targets_lst) if targets_lst else torch.empty(0, dtype=torch.long)
+
+        return {"input_ids": inputs_tensor, "labels": targets_tensor}
 
     return collate
 

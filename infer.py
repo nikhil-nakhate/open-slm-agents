@@ -58,6 +58,31 @@ def generate(model, tokenizer, prompt: str, device: torch.device, max_new_tokens
         return tokenizer.decode(gen_ids)
 
 
+def stream_generate(model, tokenizer, prompt: str, device: torch.device, max_new_tokens: int = 50, temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0, greedy: bool = False) -> None:
+    """Generate while printing tokens as they are produced (streaming)."""
+    import sys
+    model.eval()
+    with torch.no_grad():
+        input_ids = tokenizer.encode(prompt)
+        ids = list(input_ids)
+        eos_id: Optional[int] = getattr(tokenizer, "eos_id", None)
+
+        max_ctx = int(getattr(model, "max_seq_len", 1024))
+        x = torch.tensor([ids], dtype=torch.long, device=device)
+        for _ in range(max_new_tokens):
+            x_cond = x[:, -max_ctx:]
+            logits = model(x_cond)  # [1, T, V]
+            next_logits = logits[0, -1, :]
+            next_id = _sample_next_token(next_logits, temperature=temperature, top_k=top_k, top_p=top_p, greedy=greedy)
+            ids.append(next_id)
+            # Stream just the latest token
+            sys.stdout.write(tokenizer.decode([next_id]))
+            sys.stdout.flush()
+            x = torch.tensor([ids], dtype=torch.long, device=device)
+            if eos_id is not None and next_id == eos_id:
+                break
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate text from a model checkpoint (interactive)")
     parser.add_argument("--config", type=str, required=True)
@@ -124,7 +149,8 @@ def main():
             print("Bye.")
             break
 
-        out = generate(
+        # Stream tokens as they are generated
+        stream_generate(
             model,
             tokenizer,
             prompt=prompt,
@@ -135,7 +161,7 @@ def main():
             top_p=top_p,
             greedy=greedy,
         )
-        print(out, "\n")
+        print("\n")
 
 
 if __name__ == "__main__":

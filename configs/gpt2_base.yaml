@@ -63,6 +63,12 @@ train:
     num_workers: 2
     pin_memory: true
     drop_last: false
+  splits:
+    ratios:
+      train: 0.85
+      eval: 0.10
+      test: 0.05
+    seed: 42
 
 data:
   transforms:
