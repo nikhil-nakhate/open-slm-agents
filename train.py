@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any, List
 
 import torch
 import torch.nn as nn
@@ -13,6 +15,102 @@ from data.dataset import build_dataset_and_collate
 from scripts.load_gpt_weights import load_weights_into_gpt
 from tqdm import tqdm
 
+
+
+def process_batch_samples(input_batch: torch.Tensor, target_batch: torch.Tensor, 
+                         model: Any, device: Any, tokenizer: Any, 
+                         max_new_tokens: int, context_size: int, batch_idx: int, 
+                         max_workers: int = 4) -> List[Dict[str, Any]]:
+    """
+    Process all samples in a batch using multithreading.
+    This function includes both generation and post-processing for each sample.
+    """
+    def process_single_sample(i: int) -> Dict[str, Any]:
+        """Process a single sample within the batch - includes generation."""
+        input_tokens = input_batch[i]
+        target_tokens = target_batch[i]
+        
+        # Generate response for this single sample
+        with torch.no_grad():
+            token_ids = generate(
+                model=model,
+                idx=input_tokens.unsqueeze(0).to(device),  # Add batch dimension
+                max_new_tokens=max_new_tokens,
+                context_size=context_size
+            )
+            # Remove batch dimension
+            token_ids = token_ids.squeeze(0)
+        
+        # Decode input and target to get the formatted text
+        if hasattr(tokenizer, 'decode'):
+            input_text = tokenizer.decode(input_tokens.cpu().tolist())
+            # Filter out ignore index tokens for target decoding
+            target_tokens_filtered = target_tokens[target_tokens != -100]
+            if len(target_tokens_filtered) > 0:
+                target_text = tokenizer.decode(target_tokens_filtered.cpu().tolist())
+            else:
+                target_text = ""
+        else:
+            input_text = str(input_tokens.cpu().tolist())
+            target_text = str(target_tokens.cpu().tolist())
+        
+        # Extract original fields using reverse function
+        original_fields = reverse_format_input(input_text)
+        instruction = original_fields["instruction"]
+        input_field = original_fields["input"]
+        
+        # Extract output from target text
+        output = ""
+        if "### Response:" in target_text:
+            output = target_text.split("### Response:")[1].strip()
+    
+        # Decode generated text
+        if hasattr(tokenizer, 'decode'):
+            generated_text = tokenizer.decode(token_ids.cpu().tolist())
+        else:
+            generated_text = str(token_ids.cpu().tolist())
+        
+        # Extract response by finding the "### Response:" marker and taking everything after it
+        response_marker = "### Response:"
+        if response_marker in generated_text:
+            model_response = generated_text.split(response_marker, 1)[1].strip()
+        else:
+            # If no response marker found, take everything after the input text
+            model_response = generated_text[len(input_text):].strip()
+        
+        # Return result in original instruction-data.json format
+        return {
+            "instruction": instruction,
+            "input": input_field,
+            "output": output,
+            "model_response": model_response
+        }
+    
+    # Process samples in parallel using ThreadPoolExecutor
+    batch_results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_index = {
+            executor.submit(process_single_sample, i): i 
+            for i in range(input_batch.size(0))
+        }
+        
+        # Collect results as they complete
+        for future in tqdm(future_to_index, desc=f"Processing batch {batch_idx}"):
+            try:
+                result = future.result()
+                batch_results.append(result)
+            except Exception as exc:
+                print(f'Sample processing generated an exception: {exc}')
+                # Add empty result to maintain order
+                batch_results.append({
+                    "instruction": "",
+                    "input": "",
+                    "output": "",
+                    "model_response": ""
+                })
+    
+    return batch_results
 
 
 def reverse_format_input(formatted_text: str) -> dict:
@@ -43,9 +141,10 @@ def reverse_format_input(formatted_text: str) -> dict:
     return {"instruction": instruction, "input": input_field}
 
 
-def test_model_simple(model, test_loader, device, tokenizer, max_new_tokens=256, output_file="test-results.json"):
+def test_model_simple(model, test_loader, device, tokenizer, max_new_tokens=256, output_file="test-results.json", max_workers=4):
     """
     Test model on test loader and save results - extracting original fields from dataset.
+    Uses multithreading to process samples in parallel for better performance.
     """
     print("Starting test_model_simple...")
     model.eval()
@@ -54,6 +153,8 @@ def test_model_simple(model, test_loader, device, tokenizer, max_new_tokens=256,
     context_size = getattr(model, 'max_seq_len', 1024)
     print(f"Context size: {context_size}")
     print(f"Test loader length: {len(test_loader)}")
+    print(f"Using {max_workers} worker threads for parallel processing")
+    print("WARNING: Individual sample generation may use more GPU memory. Consider reducing max_workers if you encounter memory issues.")
     
     # Process test loader and extract original fields by reversing the transform
     test_data = []
@@ -67,64 +168,17 @@ def test_model_simple(model, test_loader, device, tokenizer, max_new_tokens=256,
             else:
                 input_batch, target_batch = batch
             
-            # Generate response using the same approach as notebook
-            token_ids_batch = generate(
-                model=model,
-                idx=input_batch.to(device),
-                max_new_tokens=max_new_tokens,
-                context_size=context_size
+            print(f"Processing batch {batch_idx} with {input_batch.size(0)} samples")
+            
+            # Process samples in parallel using the batch processing function
+            # This now includes both generation and post-processing
+            batch_results = process_batch_samples(
+                input_batch, target_batch, model, device, tokenizer, 
+                max_new_tokens, context_size, batch_idx, max_workers
             )
-            print(f"Token IDs generated for batch {batch_idx}")
             
-            # Process each sample in the batch
-            for _, i in enumerate(tqdm(range(input_batch.size(0)), desc="Testing")):                
-                input_tokens = input_batch[i]
-                target_tokens = target_batch[i]
-                
-                # Decode input and target to get the formatted text
-                if hasattr(tokenizer, 'decode'):
-                    input_text = tokenizer.decode(input_tokens.cpu().tolist())
-                    # Filter out ignore index tokens for target decoding
-                    target_tokens_filtered = target_tokens[target_tokens != -100]
-                    if len(target_tokens_filtered) > 0:
-                        target_text = tokenizer.decode(target_tokens_filtered.cpu().tolist())
-                    else:
-                        target_text = ""
-                else:
-                    input_text = str(input_tokens.cpu().tolist())
-                    target_text = str(target_tokens.cpu().tolist())
-                
-                # Extract original fields using reverse function
-                original_fields = reverse_format_input(input_text)
-                instruction = original_fields["instruction"]
-                input_field = original_fields["input"]
-                
-                # Extract output from target text
-                output = ""
-                if "### Response:" in target_text:
-                    output = target_text.split("### Response:")[1].strip()
-            
-                # Decode generated text
-                if hasattr(tokenizer, 'decode'):
-                    generated_text = tokenizer.decode(token_ids_batch[i].cpu().tolist())
-                else:
-                    generated_text = str(token_ids_batch[i].cpu().tolist())
-                
-                # Extract response by finding the "### Response:" marker and taking everything after it
-                response_marker = "### Response:"
-                if response_marker in generated_text:
-                    model_response = generated_text.split(response_marker, 1)[1].strip()
-                else:
-                    # If no response marker found, take everything after the input text
-                    model_response = generated_text[len(input_text):].strip()
-                
-                # Store result in original instruction-data.json format
-                test_data.append({
-                    "instruction": instruction,
-                    "input": input_field,
-                    "output": output,
-                    "model_response": model_response
-                })
+            # Add batch results to test_data
+            test_data.extend(batch_results)
     
     # Create output directory and save results (instruction-data.json format)
     os.makedirs("outputs", exist_ok=True)
@@ -340,6 +394,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--test", action="store_true", help="Run testing instead of training")
     parser.add_argument("--test_output", type=str, default="test-results.json", help="Output file for test results")
+    parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of worker threads for parallel processing during testing")
     args = parser.parse_args()
 
     # Simple training mode
@@ -405,7 +460,7 @@ def main():
         print(f"Test dataset size: {len(test_dataset)}")
         results = test_model_simple(
             model, test_loader, device, tokenizer, 
-            max_new_tokens=75, output_file=args.test_output
+            max_new_tokens=75, output_file=args.test_output, max_workers=args.max_workers
         )
         print(f"Test completed with {len(results)} results")
     else:
@@ -423,7 +478,7 @@ def main():
         print("Running test on trained model...")
         results = test_model_simple(
             model, test_loader, device, tokenizer, 
-            max_new_tokens=256, output_file="trained-model-test-results.json"
+            max_new_tokens=256, output_file="trained-model-test-results.json", max_workers=args.max_workers
         )
 
 if __name__ == "__main__":
