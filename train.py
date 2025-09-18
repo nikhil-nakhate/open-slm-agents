@@ -295,8 +295,7 @@ def _setup_training_components(cfg: Dict[str, Any], device, logger_kind: str):
     max_steps = int(train_cfg.get("max_steps", 1000))
     log_every = int(train_cfg.get("log_every", 10))
 
-    # scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", True) and device.type == "cuda")
-    scaler = None
+    scaler = torch.amp.GradScaler('cuda', enabled=train_cfg.get("amp", True) and device.type == "cuda")
     
     return model, tokenizer, opt, train_dl, eval_dl, test_dl, logger, out_dir, save_every, max_steps, log_every, scaler
 
