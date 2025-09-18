@@ -1,10 +1,13 @@
 import argparse
 import os
+import pickle
+import sys
 from typing import Optional
 import torch
 
 from ops.config import load_config
 from models.build import build_model_from_cfg
+from scripts.load_gpt_weights import load_weights_into_gpt
 
 
 def _sample_next_token(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0, greedy: bool = False) -> int:
@@ -60,7 +63,6 @@ def generate(model, tokenizer, prompt: str, device: torch.device, max_new_tokens
 
 def stream_generate(model, tokenizer, prompt: str, device: torch.device, max_new_tokens: int = 50, temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0, greedy: bool = False) -> None:
     """Generate while printing tokens as they are produced (streaming)."""
-    import sys
     model.eval()
     with torch.no_grad():
         input_ids = tokenizer.encode(prompt)
@@ -98,9 +100,6 @@ def main():
 
     # Load custom converted GPT-2 weights if provided
     if args.weights_dir:
-        import pickle
-        from scripts.load_gpt_weights import load_weights_into_gpt
-
         path = args.weights_dir
         params = None
         if os.path.isdir(path):
@@ -113,7 +112,7 @@ def main():
                 raise FileNotFoundError(f"No params.pt or params.pkl found in {path}")
         else:
             if path.endswith(".pt"):
-                params = torch.load(path, map_location="cpu")
+                params = torch.load(path, map_location="cpu", weights_only=False)
             elif path.endswith(".pkl"):
                 with open(path, "rb") as f:
                     params = pickle.load(f)
@@ -122,7 +121,7 @@ def main():
         load_weights_into_gpt(model, params)
         model.to(device)
     elif args.checkpoint and os.path.exists(args.checkpoint):
-        state = torch.load(args.checkpoint, map_location=device)
+        state = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         model.to(device)
     else:
@@ -143,6 +142,7 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
             break
+        
         if not prompt:
             continue
         if prompt.lower() in {"/exit", "/quit", ":q", "q"}:

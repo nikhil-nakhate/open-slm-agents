@@ -14,6 +14,7 @@ setup(
         "numpy>=1.23",
         "transformers>=4.40",
         "tensorflow>=2.11",
+        "tiktoken>=0.5.0",
     ],
     extras_require={
         # Hugging Face tokenizer/model support
@@ -21,10 +22,12 @@ setup(
         # Logging backends
         "wandb": ["wandb>=0.15"],
         "tb": ["tensorboard>=2.11"],
+        # Test dependencies
+        "test": ["pytest>=7.0.0", "pytest-cov>=4.0.0"],
         # Developer tools
         "dev": ["black>=23.0", "flake8>=6.0"],
         # Everything optional
-        "all": ["transformers>=4.40", "wandb>=0.15", "tensorboard>=2.11"],
+        "all": ["transformers>=4.40", "wandb>=0.15", "tensorboard>=2.11", "pytest>=7.0.0", "pytest-cov>=4.0.0"],
     },
     entry_points={
         "console_scripts": [

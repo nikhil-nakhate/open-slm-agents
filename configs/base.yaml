@@ -3,31 +3,38 @@ model:
   params:
     max_seq_len: 256
     dropout: 0.1
-    # vocab_size can be inferred from tokenizer if omitted
+    # vocab_size is inferred from tokenizer if omitted
+  
   modules:
     tokenizer:
       kind: simple_char
       params: {}
       freeze: false
+    
     token_embedding:
       freeze: false
+    
     position_embedding:
       freeze: false
+    
     emb_dropout:
       p: 0.1
+    
     transformer:
+      dim: 256
+      n_layers: 4
+      n_heads: 4
       dropout: 0.1
       mlp_mult: 4
       activation: gelu
-      dim: 256
       qkv_bias: false
-      n_layers: 4
-      n_heads: 4
       prenorm: true
       freeze: false
+    
     output_projection:
       tie_weights: true
       freeze: false
+    
     loss:
       kind: cross_entropy
       params:
@@ -35,23 +42,29 @@ model:
       freeze: false
 
 train:
-  lr: 0.0003
-  betas: [0.9, 0.95]
-  weight_decay: 0.1
+  # Optimizer settings
+  optimizer:
+    kind: AdamW
+    lr: 0.00005
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+    eps: 1e-8
+  
+  # Training loop settings
   batch_size: 8
   max_steps: 200
   save_every: 100
   log_every: 10
+  eval_every: 50
+  max_eval_batches: 50
   amp: true
+  
+  # Training stability
+  grad_clip: 1.0
+  grad_accum_steps: 1
+  
+  # Data settings
   data_dir: data
-  output_dir: outputs/base-run
-  project: open-slm
-  log_dir: runs
-  run_name: base
-  scheduler:
-    kind: cosine
-    warmup_steps: 50
-    min_lr: 0.0
   data_loader:
     kind: language_modeling_text
     block_size: 128
@@ -59,18 +72,35 @@ train:
     num_workers: 0
     pin_memory: true
     drop_last: false
+  
+  # Data splits
   splits:
     ratios:
       train: 0.85
       eval: 0.10
       test: 0.05
     seed: 42
+  
+  # Output settings
+  output_dir: outputs/base-run
+  run_name: base
+  
+  # Logging settings
+  project: open-slm
+  log_dir: runs
+  
+  # Learning rate scheduler (set to null to disable)
+  scheduler:
+    kind: cosine
+    warmup_steps: 50
+    min_lr: 0.0
 
 data:
   transforms:
     template: alpaca
 
 eval:
+  # Generation parameters
   max_new_tokens: 50
   temperature: 1.0
   top_k: 0

@@ -17,15 +17,12 @@ def load_weights_into_gpt(gpt, params: Dict[str, Any]):
     """
 
     # Embeddings
-    print(params["wpe"])
-    print("From config", gpt.pos_emb.pos_emb.weight)
     gpt.pos_emb.pos_emb.weight = assign(gpt.pos_emb.pos_emb.weight, params["wpe"])
     gpt.tok_emb.token_emb.weight = assign(gpt.tok_emb.token_emb.weight, params["wte"])
 
     # Transformer blocks
     for b in range(len(params["blocks"])):
         block = gpt.trf_blocks[b]
-        print("block", block)
 
         # Attention qkv split (transpose for PyTorch linear layout)
         q_w, k_w, v_w = np.split(params["blocks"][b]["attn"]["c_attn"]["w"], 3, axis=-1)

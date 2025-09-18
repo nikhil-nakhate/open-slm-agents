@@ -12,5 +12,14 @@ model:
 train:
   run_name: gpt2-medium
   output_dir: outputs/gpt2-medium
+  # Data settings for SFT
+  data_dir: data/datasets/sft
+  data_loader:
+    kind: sft_json
+    block_size: 1024
+    shuffle: true
+    num_workers: 0
+    pin_memory: true
+    drop_last: true
   # Optionally adjust batch size if memory constrained
   # batch_size: 2

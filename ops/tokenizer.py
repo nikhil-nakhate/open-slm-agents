@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional
 import os
 import re
+import tiktoken
 
 
 class BaseTokenizer:
@@ -107,19 +108,19 @@ class RegexWordTokenizer(BaseTokenizer):
 
 
 def build_tokenizer(cfg: Dict[str, Any]) -> BaseTokenizer:
-    kind = cfg.get("kind", "simple_char")
+    kind = cfg.get("kind", "tiktoken")
     params = cfg.get("params", {})
 
     if kind == "simple_char":
         return SimpleCharTokenizer(**params)
     elif kind == "regex_word":
         return RegexWordTokenizer()
+    elif kind in {"tiktoken", "tiktoken_gpt2"}:
+        name = params.get("name", "gpt2")
+        enc = tiktoken.get_encoding(name)
+        return TiktokenTokenizer(enc)
     elif kind in {"hf_gpt2", "huggingface"}:
-        # Lazy import to avoid hard dependency
-        try:
-            from transformers import GPT2TokenizerFast  # type: ignore
-        except Exception as e:  # pragma: no cover - optional dependency
-            raise ImportError("Install transformers to use hf_gpt2 tokenizer") from e
+        from transformers import GPT2TokenizerFast  # type: ignore
         name = params.get("name", "gpt2")
         add_prefix_space = params.get("add_prefix_space", True)
         tok = GPT2TokenizerFast.from_pretrained(name, add_prefix_space=add_prefix_space)
@@ -153,3 +154,29 @@ class HFTokenizer(BaseTokenizer):
     @property
     def eos_id(self) -> Optional[int]:
         return getattr(self.tok, "eos_token_id", None)
+
+
+class TiktokenTokenizer(BaseTokenizer):
+    """Wrapper around tiktoken encodings (default: GPT-2)."""
+
+    def __init__(self, encoding):
+        self.encoding = encoding
+        # Compute eos id via special token
+        self._eos = self.encoding.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
+
+    def encode(self, text: str) -> List[int]:
+        return self.encoding.encode(text, allowed_special={"<|endoftext|>"})
+
+    def decode(self, ids: List[int]) -> str:
+        # Skip pad ids (reserved as the last vocab index)
+        pad = self.pad_id
+        filtered = [i for i in ids if i != pad]
+        return self.encoding.decode(filtered)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self.encoding.n_vocab)
+
+    @property
+    def eos_id(self) -> Optional[int]:
+        return self._eos
