@@ -1,4 +1,4 @@
-from .transformer import Transformer  # noqa: F401
+from .transformer import TransformerBlock  # noqa: F401
 from .mha import MultiHeadAttention  # noqa: F401
 from .layer_norm import LayerNorm  # noqa: F401
 from .embeddings import TokenPositionalEmbedding, OutputProjection, TokenEmbedding, PositionEmbedding  # noqa: F401

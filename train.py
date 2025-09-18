@@ -391,7 +391,6 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Config name or path (e.g., gpt2_base)")
     parser.add_argument("--logger", type=str, default="none", help="Logger: none|wandb|tensorboard")
     parser.add_argument("--weights_dir", type=str, default=None, help="Path to converted GPT weights (dir or .pt/.pkl)")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--test", action="store_true", help="Run testing instead of training")
     parser.add_argument("--test_output", type=str, default="test-results.json", help="Output file for test results")
     parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of worker threads for parallel processing during testing")

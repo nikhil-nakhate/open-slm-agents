@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional
 import torch.nn as nn
 
 from .embeddings import TokenPositionalEmbedding, OutputProjection, TokenEmbedding, PositionEmbedding
-from .transformer import Transformer, TransformerBlock
+from .transformer import TransformerBlock
 from .layer_norm import LayerNorm
 from .losses import build_loss as _build_loss
 from ops.tokenizer import build_tokenizer as _build_tokenizer
