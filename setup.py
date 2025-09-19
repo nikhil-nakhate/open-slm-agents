@@ -15,6 +15,11 @@ setup(
         "transformers>=4.40",
         "tensorflow>=2.11",
         "tiktoken>=0.5.0",
+        "PyMuPDF>=1.23.0",
+        "tqdm>=4.65.0",
+        "accelerate>=0.20.0",
+        "bitsandbytes>=0.41.0",
+        "flash-attn>=2.0.0",
     ],
     extras_require={
         # Hugging Face tokenizer/model support
