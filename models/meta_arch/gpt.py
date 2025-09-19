@@ -48,11 +48,12 @@ class GPT(nn.Module):
         max_seq_len: int,
         dropout: float = 0.0,
         modules_cfg: Optional[Dict[str, Any]] = None,
+        weights: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         modules_cfg = modules_cfg or {}
 
-        # Embeddings (separate token and position) + dropout
+        # Embeddings + dropout
         tok_emb_cfg = modules_cfg.get("token_embedding", {})
         pos_emb_cfg = modules_cfg.get("position_embedding", {})
         emb_drop_cfg = modules_cfg.get("emb_dropout", {})
@@ -60,25 +61,22 @@ class GPT(nn.Module):
         self.pos_emb = build_position_embedding(max_seq_len, dim, pos_emb_cfg)
         self.drop_emb = build_emb_dropout(dropout, emb_drop_cfg)
 
-        # Transformer blocks (sequential)
+        # Transformer blocks
         tf_cfg = modules_cfg.get("transformer", {})
         if "dropout" not in tf_cfg:
             tf_cfg["dropout"] = dropout
         tf_cfg.setdefault("context_length", max_seq_len)
         self.trf_blocks = build_transformer_blocks(dim, n_layers, n_heads, tf_cfg)
 
-        # Output projection (optionally tie weights) ties to token embedding
         out_cfg = modules_cfg.get("output_projection", {})
         tie_to = getattr(self.tok_emb, "token_emb", None)
         self.out_head = build_output_projection(dim, vocab_size, out_cfg, tie_to=tie_to)
 
-        # Final norm as in many GPT implementations
         self.final_norm = build_layer_norm(dim, modules_cfg.get("final_norm", {}))
 
-        params = torch.load(f"weights/gpt2/355M/params.pt", weights_only=False)
-        self.load_weights_into_gpt(params)
+        if weights is not None:
+            self.load_weights_into_gpt(weights)
 
-        # Buffers for causal LM head convenience
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
 
@@ -90,9 +88,11 @@ class GPT(nn.Module):
     def from_config(cls, cfg: Dict[str, Any]) -> "GPT":
         model_cfg = cfg.get("model", {})
         params = model_cfg.get("params", {})
-        print(params)
         modules_cfg = model_cfg.get("modules", {})
-
+        weights_path = model_cfg.get("weights", None)
+        weights = None
+        if weights_path is not None:
+            weights = torch.load(f"{weights_path}", weights_only=False)
         # Build tokenizer first and infer vocab if needed
         tok_cfg = modules_cfg.get("tokenizer", {"kind": "simple_char"})
         tokenizer = build_tokenizer(tok_cfg)
@@ -113,11 +113,12 @@ class GPT(nn.Module):
             max_seq_len=params["max_seq_len"],
             dropout=params.get("dropout", 0.0),
             modules_cfg=modules_cfg,
+            weights=weights,
         )
         model = cls(**init_args)
-        # Attach tokenizer to model for downstream use (e.g., datasets/eval)
+        # Attach tokenizer to model for downstream use
         model.tokenizer = tokenizer
-        # Validate attachments / perform any extra setup
+
         return model
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):

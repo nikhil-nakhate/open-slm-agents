@@ -8,6 +8,7 @@ model:
       n_layers: 24
       n_heads: 16
       qkv_bias: true
+  weights: weights/gpt2/355M/params.pt
 
 train:
   run_name: gpt2-medium
