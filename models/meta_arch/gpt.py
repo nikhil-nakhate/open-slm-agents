@@ -1,6 +1,7 @@
 from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
+import numpy as np
 
 from .. import register_model
 from ..modules.build import (
@@ -74,6 +75,9 @@ class GPT(nn.Module):
         # Final norm as in many GPT implementations
         self.final_norm = build_layer_norm(dim, modules_cfg.get("final_norm", {}))
 
+        params = torch.load(f"weights/gpt2/355M/params.pt", weights_only=False)
+        self.load_weights_into_gpt(params)
+
         # Buffers for causal LM head convenience
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
@@ -114,15 +118,7 @@ class GPT(nn.Module):
         # Attach tokenizer to model for downstream use (e.g., datasets/eval)
         model.tokenizer = tokenizer
         # Validate attachments / perform any extra setup
-        model._post_init()
         return model
-
-    def _post_init(self):
-        # Ensure tokenizer is present when built via from_config
-        if not hasattr(self, "tokenizer") or self.tokenizer is None:
-            raise ValueError(
-                "Tokenizer must be attached to the model. Ensure model.modules.tokenizer is configured and built."
-            )
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
         # idx: [B, T]
@@ -138,3 +134,76 @@ class GPT(nn.Module):
             loss = self.loss_fn(logits, targets)
             return logits, loss
         return logits
+
+    def assign(self, left: torch.nn.Parameter, right: np.ndarray) -> torch.nn.Parameter:
+        if tuple(left.shape) != tuple(right.shape):
+            raise ValueError(f"Shape mismatch. Left: {tuple(left.shape)}, Right: {tuple(right.shape)}")
+        # Create a Parameter with the same dtype/device as left
+        tensor = torch.as_tensor(right, dtype=left.dtype, device=left.device)
+        return torch.nn.Parameter(tensor)
+
+    def load_weights_into_gpt(self, params: Dict[str, Any]):
+        """Loads converted GPT-2 weights into our GPT model structure.
+
+        This function adapts to our module naming:
+        - gpt.tok_emb.token_emb.weight
+        - gpt.pos_emb.pos_emb.weight
+        - gpt.trf_blocks[b].attn.(W_query/W_key/W_value/out_proj)
+        - gpt.trf_blocks[b].mlp.(fc1/fc2)
+        - gpt.trf_blocks[b].ln1/ln2.(weight/bias)
+        - gpt.final_norm.(weight/bias)
+        - gpt.out_head.weight
+        """
+
+        # Embeddings
+        self.pos_emb.pos_emb.weight = self.assign(self.pos_emb.pos_emb.weight, params["wpe"])
+        self.tok_emb.token_emb.weight = self.assign(self.tok_emb.token_emb.weight, params["wte"])
+
+        # Transformer blocks
+        for b in range(len(params["blocks"])):
+            block = self.trf_blocks[b]
+
+            # Attention qkv split (transpose for PyTorch linear layout)
+            q_w, k_w, v_w = np.split(params["blocks"][b]["attn"]["c_attn"]["w"], 3, axis=-1)
+            block.attn.W_query.weight = self.assign(block.attn.W_query.weight, q_w.T)
+            block.attn.W_key.weight = self.assign(block.attn.W_key.weight, k_w.T)
+            block.attn.W_value.weight = self.assign(block.attn.W_value.weight, v_w.T)
+
+            q_b, k_b, v_b = np.split(params["blocks"][b]["attn"]["c_attn"]["b"], 3, axis=-1)
+            block.attn.W_query.bias = self.assign(block.attn.W_query.bias, q_b)
+            block.attn.W_key.bias = self.assign(block.attn.W_key.bias, k_b)
+            block.attn.W_value.bias = self.assign(block.attn.W_value.bias, v_b)
+
+            block.attn.out_proj.weight = self.assign(
+                block.attn.out_proj.weight, params["blocks"][b]["attn"]["c_proj"]["w"].T
+            )
+            block.attn.out_proj.bias = self.assign(
+                block.attn.out_proj.bias, params["blocks"][b]["attn"]["c_proj"]["b"]
+            )
+
+            # MLP
+            block.mlp.fc1.weight = self.assign(block.mlp.fc1.weight, params["blocks"][b]["mlp"]["c_fc"]["w"].T)
+            block.mlp.fc1.bias = self.assign(block.mlp.fc1.bias, params["blocks"][b]["mlp"]["c_fc"]["b"])
+            block.mlp.fc2.weight = self.assign(block.mlp.fc2.weight, params["blocks"][b]["mlp"]["c_proj"]["w"].T)
+            block.mlp.fc2.bias = self.assign(block.mlp.fc2.bias, params["blocks"][b]["mlp"]["c_proj"]["b"])
+
+            # LayerNorms
+            block.ln1.weight = self.assign(block.ln1.weight, params["blocks"][b]["ln_1"]["g"])
+            block.ln1.bias = self.assign(block.ln1.bias, params["blocks"][b]["ln_1"]["b"])
+            block.ln2.weight = self.assign(block.ln2.weight, params["blocks"][b]["ln_2"]["g"])
+            block.ln2.bias = self.assign(block.ln2.bias, params["blocks"][b]["ln_2"]["b"])
+
+        # Final norm and output head
+        ln_f = params.get("ln_f", {})
+        if ln_f:
+            self.final_norm.weight = self.assign(self.final_norm.weight, ln_f.get("g"))
+            self.final_norm.bias = self.assign(self.final_norm.bias, ln_f.get("b"))
+        else:
+            # Fallback if already flattened (unlikely)
+            self.final_norm.weight = self.assign(self.final_norm.weight, params["g"])
+            self.final_norm.bias = self.assign(self.final_norm.bias, params["b"])
+        # Output head (may be weight-tied to token embeddings)
+        if hasattr(self.out_head, "proj"):
+            self.out_head.proj.weight = self.assign(self.out_head.proj.weight, params["wte"])
+        else:
+            self.out_head.weight = self.assign(self.out_head.weight, params["wte"])

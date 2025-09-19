@@ -402,11 +402,7 @@ def main():
     
     # Build model
     model = build_model_from_cfg(cfg)
-    if args.weights_dir:
-        # Use the existing weight loading function
-        from scripts.load_gpt_weights import load_weights_into_gpt
-        params = torch.load(f"{args.weights_dir}/params.pt", map_location=device, weights_only=False)
-        load_weights_into_gpt(model, params)
+
     model = model.to(device)
     
     # Build dataset and dataloaders
