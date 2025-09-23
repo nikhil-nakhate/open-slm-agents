@@ -8,6 +8,28 @@ agent:
   supabase:
     table: chunks
     batch_insert: 200
+    match_fn: match_documents
+    match_count: 3
+    filter:
+      source: "{source_path}"
+  inference:
+    doc_id: nutrition-human-nutrition-text
+    match_count: 3
+    show_context: true
+    source_path: data/datasets/rag/human-nutrition-text.pdf
+    system_prompt: |
+      You are a nutrition domain assistant. Answer questions using only the retrieved
+      context. If the answer is not available, respond with "I don't know." Keep
+      responses brief and factual.
+    prompt_template: |
+      Use the context below to answer the question. Cite relevant details from the
+      context and do not fabricate information.
+
+      Context:
+      {context}
+
+      Question: {question}
+      Answer:
   chunker:
     strategy: fixed
     params:
@@ -22,5 +44,8 @@ agent:
     name: text-embedding-3-small
     batch_size: 100
   model:
-    config_name: gpt2_medium
-    purpose: inference
+    # config_name: gpt2_medium
+    model_zoo_id: openai/gpt-4o-mini
+    name: gpt-4o-mini
+    provider: openai
+    temperature: 0.7 

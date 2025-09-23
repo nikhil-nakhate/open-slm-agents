@@ -9,15 +9,14 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-import yaml
 from dotenv import find_dotenv, load_dotenv
 from openai import OpenAI
 from supabase import Client, create_client
 from tqdm import tqdm
 
 from data.document import DocumentPage, PDFDocument, create_document
-from ops.chunking.chunker import Chunker, ChunkerFactory
-from ops.model_zoo import get_model, get_model_config
+from ops.agent_utils import build_chunker, load_agent_config, resolve_model_section
+from ops.chunking.chunker import Chunker
 
 
 # Ensure environment variables (Supabase/OpenAI keys) are loaded.
@@ -33,59 +32,6 @@ def pdf_pages(path: str) -> Iterable[DocumentPage]:
 
     for page in document.iter_pages():
         yield page
-
-
-def load_agent_config(config_path: str) -> Dict[str, Any]:
-    with open(config_path, "r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    agent_cfg = data.get("agent")
-    if not agent_cfg:
-        raise ValueError("Agent configuration must be nested under the 'agent' key")
-    return agent_cfg
-
-
-def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base)
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def resolve_model_section(section: Dict[str, Any]) -> Dict[str, Any]:
-    model_cfg = dict(section or {})
-
-    model_id = model_cfg.pop("model_zoo_id", None)
-    config_name = model_cfg.pop("config_name", None)
-    config_path = model_cfg.pop("config_path", None)
-
-    resolved: Dict[str, Any] = {}
-    if model_id:
-        try:
-            resolved = _merge_dicts(resolved, get_model(model_id))
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                f"Model zoo entry '{model_id}' not found and no matching config exists"
-            ) from exc
-
-    if config_name:
-        resolved = _merge_dicts(resolved, get_model_config(config_name))
-
-    if config_path:
-        resolved = _merge_dicts(resolved, get_model_config(config_path))
-
-    resolved = _merge_dicts(resolved, model_cfg)
-    return resolved
-
-
-def build_chunker(config: Dict[str, Any]) -> Chunker:
-    strategy = (config or {}).get("strategy", "fixed")
-    params = (config or {}).get("params", {})
-    return ChunkerFactory.create_chunker(strategy, **params)
-
-
 def chunk_document(chunker: Chunker, pages: Iterable[Any]) -> List[Dict[str, Any]]:
     page_payload = []
     for page in pages:
@@ -138,7 +84,6 @@ def ingest_single_document(
     chunker: Chunker,
     embed_model: str,
     embed_batch: int,
-    model_cfg: Dict[str, Any],
     supabase_client: Client,
     openai_client: OpenAI,
     table_name: str,
@@ -195,7 +140,6 @@ def ingest_single_document(
                 "content": content,
                 "metadata": meta,
                 "embedding": embedding,
-                "model_info": model_cfg or None,
             }
         )
 
@@ -248,7 +192,6 @@ def ingest(config_path: str) -> None:
             chunker=chunker,
             embed_model=embed_model,
             embed_batch=embed_batch,
-            model_cfg=model_cfg,
             supabase_client=supabase_client,
             openai_client=openai_client,
             table_name=table_name,
