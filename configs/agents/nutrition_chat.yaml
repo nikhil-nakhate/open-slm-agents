@@ -13,7 +13,6 @@ agent:
     filter:
       source: "{source_path}"
   inference:
-    doc_id: nutrition-human-nutrition-text
     match_count: 3
     show_context: true
     source_path: data/datasets/rag/human-nutrition-text.pdf
