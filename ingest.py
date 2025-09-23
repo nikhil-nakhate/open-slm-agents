@@ -6,6 +6,7 @@ that defines chunking, embedding, and model settings.
 
 import argparse
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -77,6 +78,11 @@ def resolve_input_paths(path_or_dir: str) -> List[Path]:
         return pdfs
 
     raise ValueError(f"Unsupported input path: {candidate}")
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-")
+    return slug.lower() or "document"
 
 
 def ingest_single_document(
@@ -162,7 +168,12 @@ def ingest(config_path: str) -> None:
 
     base_doc_id = agent_cfg.get("doc_id")
     if not base_doc_id:
-        raise ValueError("doc_id must be provided in the agent config")
+        config_slug = _slugify(Path(config_path).stem)
+        if Path(path_or_dir).is_dir() or len(input_paths) > 1:
+            base_doc_id = f"{config_slug}-{{name}}"
+        else:
+            base_doc_id = f"{config_slug}-docs"
+        print(f"Using inferred doc_id template '{base_doc_id}'")
 
     supabase_cfg = agent_cfg.get("supabase", {})
     table_name = supabase_cfg.get("table", "chunks")

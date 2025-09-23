@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -346,6 +347,9 @@ def run_agent_mode(args: argparse.Namespace) -> None:
     inference_cfg = agent_cfg.get("inference", {})
     base_doc_id = args.doc_id or inference_cfg.get("doc_id") or agent_cfg.get("doc_id")
     if not base_doc_id:
+        config_slug = _slugify(Path(args.config).stem)
+        base_doc_id = f"{config_slug}-docs"
+    if not base_doc_id:
         raise ValueError("doc_id must be provided either via --doc-id or in the agent config")
     if "{name}" in base_doc_id:
         raise ValueError(
@@ -469,3 +473,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-")
+    return slug.lower() or "document"
