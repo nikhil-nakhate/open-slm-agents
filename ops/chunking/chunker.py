@@ -6,7 +6,7 @@ different text chunking strategies using the Strategy pattern.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Optional
 from enum import Enum
 import random
 import textwrap
@@ -210,69 +210,148 @@ class Chunker(ABC):
 
 class FixedChunker(Chunker):
     """
-    Fixed-size chunking strategy that splits text into chunks of approximately
-    the same character length.
+    Fixed chunking strategy with optional sentence-based windows.
+
+    When configured with ``sents_per_chunk`` this behaves like the legacy
+    sentence windowing logic used in ``ingest_old.py`` while still supporting
+    the original character-length chunks by default.
     """
-    
-    def __init__(self, chunk_size: int = 500, **kwargs):
-        """
-        Initialize fixed chunker.
-        
+
+    _sentence_splitter = re.compile(r"(?<=[.!?])\s+")
+
+    def __init__(
+        self,
+        chunk_size: int = 500,
+        chunk_mode: Optional[str] = None,
+        sents_per_chunk: Optional[int] = None,
+        sentence_overlap: int = 0,
+        max_tokens: Optional[int] = None,
+        min_tokens: Optional[int] = None,
+        encoding_name: str = "cl100k_base",
+        **kwargs,
+    ):
+        """Initialize fixed chunker.
+
         Args:
-            chunk_size: Target size for each chunk in characters
+            chunk_size: Target size for each chunk in characters (char mode)
+            chunk_mode: ``"char"`` for character chunks, ``"sentence"`` for
+                sentence windows. Auto-detected when omitted.
+            sents_per_chunk: Number of sentences per chunk when in sentence mode
+            sentence_overlap: Sentences to overlap between consecutive chunks
+            max_tokens: Maximum tokens per chunk (sentence mode)
+            min_tokens: Minimum tokens required to keep a chunk (sentence mode)
+            encoding_name: Tiktoken encoding to use for sentence mode
         """
-        super().__init__(chunk_size=chunk_size, **kwargs)
+        super().__init__(
+            chunk_size=chunk_size,
+            chunk_mode=chunk_mode,
+            sents_per_chunk=sents_per_chunk,
+            sentence_overlap=sentence_overlap,
+            max_tokens=max_tokens,
+            min_tokens=min_tokens,
+            encoding_name=encoding_name,
+            **kwargs,
+        )
+
+        inferred_mode = "sentence" if sents_per_chunk else "char"
+        self.chunk_mode = (chunk_mode or inferred_mode).lower()
+        if self.chunk_mode not in {"char", "sentence"}:
+            raise ValueError("chunk_mode must be 'char' or 'sentence'")
+
         self.chunk_size = chunk_size
-    
+        self.sents_per_chunk = sents_per_chunk
+        self.sentence_overlap = sentence_overlap
+        self.max_tokens = max_tokens
+        self.min_tokens = min_tokens
+        self.encoding_name = encoding_name
+        self._encoder = None
+
     def chunk_text(self, text: str) -> List[str]:
-        """
-        Split text into chunks of approximately chunk_size characters.
-        
-        Args:
-            text: The text to be chunked
-            
-        Returns:
-            List of text chunks
-        """
+        if self.chunk_mode == "sentence":
+            return self._chunk_text_by_sentence(text)
+        return self._chunk_text_by_char(text)
+
+    def _chunk_text_by_char(self, text: str) -> List[str]:
         chunks = []
         current_chunk = ''
         words = text.split()
 
         for word in words:
-            # Check if adding the word exceeds chunk size
             if len(current_chunk) + len(word) + 1 <= self.chunk_size:
                 current_chunk += (word + ' ')
             else:
-                # Store current chunk and start new one
                 chunks.append(current_chunk.strip())
                 current_chunk = word + ' '
 
-        # Add the last chunk if not empty
         if current_chunk:
             chunks.append(current_chunk.strip())
 
         return chunks
-    
+
+    def _chunk_text_by_sentence(self, text: str) -> List[str]:
+        if not text.strip():
+            return []
+
+        if not self.sents_per_chunk:
+            raise ValueError("sents_per_chunk must be provided for sentence mode")
+
+        sentences = [seg.strip() for seg in re.split(self._sentence_splitter, text.strip()) if seg.strip()]
+        if not sentences:
+            return []
+
+        step = max(1, self.sents_per_chunk - max(0, self.sentence_overlap))
+        max_tokens = self.max_tokens or 0
+        min_tokens = self.min_tokens or 0
+
+        chunks: List[str] = []
+        start = 0
+
+        while start < len(sentences):
+            window = sentences[start : start + self.sents_per_chunk]
+            if not window:
+                break
+
+            chunk = " ".join(window)
+            token_ids = self._encode_text(chunk)
+
+            while max_tokens and len(token_ids) > max_tokens and len(window) > 1:
+                window = window[:-1]
+                chunk = " ".join(window)
+                token_ids = self._encode_text(chunk)
+
+            if not min_tokens or len(token_ids) >= min_tokens:
+                chunks.append(chunk)
+
+            start += step
+
+        return chunks
+
+    def _encode_text(self, text: str) -> List[int]:
+        if self._encoder is None:
+            try:
+                import tiktoken
+            except ImportError as exc:
+                raise ImportError(
+                    "tiktoken is required for sentence-based fixed chunking"
+                ) from exc
+            self._encoder = tiktoken.get_encoding(self.encoding_name)
+        return self._encoder.encode(text)
+
     def chunk_pages(self, pages_and_texts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Split pages of text into fixed-size chunks.
-        
-        Args:
-            pages_and_texts: List of dictionaries containing page data
-            
-        Returns:
-            List of dictionaries containing chunk data with metadata
-        """
         all_chunks = []
         for page in pages_and_texts:
             page_number = page["page_number"]
             page_text = page["text"]
+            base_metadata = {k: v for k, v in page.items() if k not in {"text"}}
 
             chunks = self.chunk_text(page_text)
             for i, chunk in enumerate(chunks):
                 chunk_metadata = self._create_chunk_metadata(chunk, page_number, i)
+                for key, value in base_metadata.items():
+                    if key not in chunk_metadata:
+                        chunk_metadata[key] = value
                 all_chunks.append(chunk_metadata)
-        
+
         return all_chunks
 
 

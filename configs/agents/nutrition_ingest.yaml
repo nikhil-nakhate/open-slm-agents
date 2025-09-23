@@ -1,0 +1,26 @@
+agent:
+  name: nutrition_ingest
+  description: Human nutrition PDF ingestion pipeline with sentence-based chunking
+  data_source:
+    type: pdf
+    path: data/datasets/rag
+  doc_id: nutrition-{name}
+  supabase:
+    table: chunks
+    batch_insert: 200
+  chunker:
+    strategy: fixed
+    params:
+      chunk_mode: sentence
+      sents_per_chunk: 20
+      sentence_overlap: 2
+      max_tokens: 1300
+      min_tokens: 50
+  embed_model:
+    model_zoo_id: openai/text-embedding-3-small
+    provider: openai
+    name: text-embedding-3-small
+    batch_size: 100
+  model:
+    config_name: gpt2_medium
+    purpose: inference

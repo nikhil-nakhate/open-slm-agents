@@ -1,8 +1,25 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+import re
+from typing import List, Dict, Any, Optional, Iterable
 import json
 import fitz  # PyMuPDF
 from tqdm.auto import tqdm
+
+
+@dataclass
+class DocumentPage:
+    """Lightweight container for a single page of text and metadata."""
+
+    page_number: int
+    text: str
+    metadata: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = dict(self.metadata)
+        data.setdefault("page_number", self.page_number)
+        data.setdefault("text", self.text)
+        return data
 
 
 class Document(ABC):
@@ -28,10 +45,16 @@ class Document(ABC):
         return self.metadata
     
     def text_formatter(self, text: str) -> str:
-        """Performs minor formatting on text."""
-        cleaned_text = text.replace("\n", " ").strip()
-        # Other potential text formatting functions can go here
-        return cleaned_text
+        """Normalize whitespace and common PDF artifacts."""
+        text = text.replace("\r", " ")
+        text = re.sub(r"-\s*\n\s*", "", text)
+        text = re.sub(r"\s+\n", "\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.replace("\n", " ").strip()
+
+    def iter_pages(self) -> Iterable[DocumentPage]:
+        """Optional iterator over document pages."""
+        raise NotImplementedError("iter_pages is not implemented for this document type")
 
 
 class JSONDocument(Document):
@@ -87,80 +110,92 @@ class PDFDocument(Document):
     def __init__(self, file_path: str, page_offset: int = 0):
         super().__init__(file_path)
         self.page_offset = page_offset
-        self.pages_and_texts: List[Dict[str, Any]] = []
+        self.pages: List[DocumentPage] = []
     
     def load(self) -> None:
         """Load PDF document content page by page."""
         doc = fitz.open(self.file_path)
-        self.pages_and_texts = []
+        self.pages = []
         
         for page_number, page in tqdm(enumerate(doc), desc="Processing PDF pages"):
             text = page.get_text()
             text = self.text_formatter(text)
-            
-            self.pages_and_texts.append({
-                "page_number": page_number + self.page_offset,
+
+            metadata = {
                 "page_char_count": len(text),
                 "page_word_count": len(text.split(" ")),
                 "page_sentence_count_raw": len(text.split(". ")),
                 "page_token_count": len(text) / 4,  # 1 token = ~4 chars
-                "text": text
-            })
+                "source": self.file_path,
+            }
+
+            self.pages.append(
+                DocumentPage(
+                    page_number=page_number + self.page_offset,
+                    text=text,
+                    metadata=metadata,
+                )
+            )
         
         doc.close()
         
         # Extract metadata
-        total_chars = sum(page["page_char_count"] for page in self.pages_and_texts)
-        total_words = sum(page["page_word_count"] for page in self.pages_and_texts)
-        total_tokens = sum(page["page_token_count"] for page in self.pages_and_texts)
-        
+        total_chars = sum(page.metadata.get("page_char_count", 0) for page in self.pages)
+        total_words = sum(page.metadata.get("page_word_count", 0) for page in self.pages)
+        total_tokens = sum(page.metadata.get("page_token_count", 0) for page in self.pages)
+
         self.metadata = {
             "file_type": "pdf",
             "file_path": self.file_path,
-            "total_pages": len(self.pages_and_texts),
+            "total_pages": len(self.pages),
             "total_char_count": total_chars,
             "total_word_count": total_words,
             "total_token_count": total_tokens,
             "page_offset": self.page_offset
         }
-    
+
     def get_text(self) -> str:
         """Extract all text content from PDF document."""
-        if not self.pages_and_texts:
+        if not self.pages:
             self.load()
-        
-        all_text = " ".join(page["text"] for page in self.pages_and_texts)
+
+        all_text = " ".join(page.text for page in self.pages)
         return self.text_formatter(all_text)
     
     def get_page_text(self, page_number: int) -> str:
         """Get text from a specific page."""
-        if not self.pages_and_texts:
+        if not self.pages:
             self.load()
-        
-        for page in self.pages_and_texts:
-            if page["page_number"] == page_number:
-                return page["text"]
+
+        for page in self.pages:
+            if page.page_number == page_number:
+                return page.text
         
         raise ValueError(f"Page {page_number} not found")
     
     def get_pages_data(self) -> List[Dict[str, Any]]:
         """Get all pages data with statistics."""
-        if not self.pages_and_texts:
+        if not self.pages:
             self.load()
-        
-        return self.pages_and_texts
+
+        return [page.to_dict() for page in self.pages]
     
     def get_page_range(self, start_page: int, end_page: int) -> str:
         """Get text from a range of pages."""
-        if not self.pages_and_texts:
+        if not self.pages:
             self.load()
-        
+
         texts = []
-        for page in self.pages_and_texts:
-            if start_page <= page["page_number"] <= end_page:
-                texts.append(page["text"])
-        
+        for page in self.pages:
+            if start_page <= page.page_number <= end_page:
+                texts.append(page.text)
+
         return self.text_formatter(" ".join(texts))
+
+    def iter_pages(self) -> Iterable[DocumentPage]:
+        if not self.pages:
+            self.load()
+        return iter(self.pages)
 
 
 class TextDocument(Document):
