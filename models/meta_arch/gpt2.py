@@ -16,13 +16,13 @@ from ..modules.build import (
 )
 
 
-@register_model("gpt")
-class GPT(nn.Module):
+@register_model("gpt2")
+class GPT2(nn.Module):
     """GPT-style Transformer language model.
 
     Expected config structure (model section):
     model:
-      name: gpt
+      name: gpt2
       params:
         vocab_size: int
         dim: int
@@ -85,7 +85,7 @@ class GPT(nn.Module):
         self.loss_fn = build_loss(loss_cfg)
 
     @classmethod
-    def from_config(cls, cfg: Dict[str, Any]) -> "GPT":
+    def from_config(cls, cfg: Dict[str, Any]) -> "GPT2":
         model_cfg = cfg.get("model", {})
         params = model_cfg.get("params", {})
         modules_cfg = model_cfg.get("modules", {})

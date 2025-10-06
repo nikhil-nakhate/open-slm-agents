@@ -1,5 +1,5 @@
 model:
-  name: gpt
+  name: gpt2
   params:
     max_seq_len: 256
     dropout: 0.1

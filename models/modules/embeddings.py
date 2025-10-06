@@ -3,26 +3,6 @@ import torch
 import torch.nn as nn
 
 
-class TokenPositionalEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, dim: int, max_seq_len: int, dropout: float = 0.0):
-        super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, dim)
-        self.pos_emb = nn.Embedding(max_seq_len, dim)
-        self.drop = nn.Dropout(dropout)
-
-        # Initialize pos embeddings with normal init similar to GPT2
-        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        # idx: [B, T]
-        B, T = idx.shape
-        device = idx.device
-        pos = torch.arange(0, T, device=device).unsqueeze(0)  # [1, T]
-        x = self.token_emb(idx) + self.pos_emb(pos)
-        x = self.drop(x)
-        return x
-
-
 class OutputProjection(nn.Module):
     def __init__(self, dim: int, vocab_size: int, tie_weights: bool = False, tie_to: nn.Embedding = None):
         super().__init__()

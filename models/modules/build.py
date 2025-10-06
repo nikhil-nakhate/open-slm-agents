@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional
 import torch.nn as nn
 
-from .embeddings import TokenPositionalEmbedding, OutputProjection, TokenEmbedding, PositionEmbedding
+from .embeddings import OutputProjection, TokenEmbedding, PositionEmbedding
 from .transformer import TransformerBlock
 from .layer_norm import LayerNorm
 from .losses import build_loss as _build_loss
@@ -16,11 +16,11 @@ def _maybe_freeze(module, cfg: Optional[Dict[str, Any]] = None):
     return module
 
 
-def build_embedding(vocab_size: int, dim: int, max_seq_len: int, cfg: Optional[Dict[str, Any]] = None):
-    cfg = cfg or {}
-    dropout = cfg.get("dropout", 0.0)
-    mod = TokenPositionalEmbedding(vocab_size, dim, max_seq_len, dropout=dropout)
-    return _maybe_freeze(mod, cfg)
+# def build_embedding(vocab_size: int, dim: int, max_seq_len: int, cfg: Optional[Dict[str, Any]] = None):
+#     cfg = cfg or {}
+#     dropout = cfg.get("dropout", 0.0)
+#     mod = TokenPositionalEmbedding(vocab_size, dim, max_seq_len, dropout=dropout)
+#     return _maybe_freeze(mod, cfg)
 
 
 
