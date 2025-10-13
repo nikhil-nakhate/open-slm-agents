@@ -22,3 +22,4 @@ def available_models() -> Dict[str, Type]:
 
 # Import built-in models to populate registry
 from .meta_arch import gpt2  # noqa: F401,E402
+from .meta_arch import gpt_oss  # noqa: F401,E402
