@@ -7,7 +7,7 @@ This implementation supports:
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,7 @@ class RotaryEmbedding(nn.Module):
         initial_context_length: int = 4096,
         ntk_alpha: float = 1.0,
         ntk_beta: float = 32.0,
-        device: torch.device | None = None,
+        device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
@@ -60,13 +60,16 @@ class RotaryEmbedding(nn.Module):
         self.ntk_beta = ntk_beta
         self.device = device
 
-    def _compute_concentration_and_inv_freq(self) -> Tuple[float, torch.Tensor]:
+    def _compute_concentration_and_inv_freq(self, device: torch.device) -> Tuple[float, torch.Tensor]:
         """Compute concentration factor and inverse frequencies for YaRN scaling.
 
         See YaRN paper: https://arxiv.org/abs/2309.00071
+
+        Args:
+            device: Device to create tensors on
         """
         freq = self.base ** (
-            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device) / self.head_dim
+            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=device) / self.head_dim
         )
 
         if self.scaling_factor > 1.0:
@@ -112,7 +115,8 @@ class RotaryEmbedding(nn.Module):
             Tuple of (rotated_q, rotated_k)
         """
         num_tokens = q.shape[0]
-        concentration, inv_freq = self._compute_concentration_and_inv_freq()
+        # Use the device from the input tensors to ensure everything is on the same device
+        concentration, inv_freq = self._compute_concentration_and_inv_freq(q.device)
 
         # Build position encodings
         t = torch.arange(num_tokens, dtype=torch.float32, device=q.device)

@@ -157,13 +157,14 @@ class GPTOSSBackbone(nn.Module):
 # Weight Loading
 # ============================================================================
 
-def load_gpt_oss_weights(model: GPTOSSBackbone, weights_path: Path, device: torch.device) -> None:
+def load_gpt_oss_weights(model: GPTOSSBackbone, weights_path: Path, device: torch.device, low_memory: bool = True) -> None:
     """Load GPT-OSS weights from HuggingFace checkpoint.
 
     Args:
         model: Model to load weights into
         weights_path: Path to weights directory
         device: Device to load weights on
+        low_memory: If True, loads weights directly into model to save memory
     """
     print(f"Loading GPT-OSS weights from {weights_path}")
 
@@ -172,24 +173,182 @@ def load_gpt_oss_weights(model: GPTOSSBackbone, weights_path: Path, device: torc
         # Look for sharded safetensors
         index_file = weights_path / "model.safetensors.index.json"
         if index_file.exists():
-            state_dict = load_safetensors_sharded(index_file, device)
+            if low_memory:
+                # Load weights directly into model to save memory
+                _load_weights_low_memory(model, index_file, device)
+            else:
+                # Traditional loading (uses more memory)
+                state_dict = load_safetensors_sharded(index_file, device)
+                state_dict = remap_hf_to_official(state_dict)
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                if missing:
+                    print(f"Warning: Missing keys: {missing[:5]}...")
+                if unexpected:
+                    print(f"Warning: Unexpected keys: {unexpected[:5]}...")
+                print(f"✓ Loaded {len(state_dict)} tensors")
         else:
             raise FileNotFoundError(f"No checkpoint found in {weights_path}")
     else:
         raise ValueError(f"Expected directory, got {weights_path}")
 
-    # Remap keys from HF format to official format
-    state_dict = remap_hf_to_official(state_dict)
 
-    # Load weights
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+def _load_weights_low_memory(model: GPTOSSBackbone, index_file: Path, device: torch.device) -> None:
+    """Load weights directly into model parameters to minimize memory usage."""
+    import json
+    import torch
+    from safetensors import safe_open
+    from ..modules.gpt_oss_utils import dequantize_mxfp4
 
-    if missing:
-        print(f"Warning: Missing keys: {missing[:5]}...")
-    if unexpected:
-        print(f"Warning: Unexpected keys: {unexpected[:5]}...")
+    with open(index_file, "r") as f:
+        index_data = json.load(f)
 
-    print(f"✓ Loaded {len(state_dict)} tensors")
+    weight_map = index_data.get("weight_map", {})
+    shards: Dict[str, set] = {}
+    for name, shard in weight_map.items():
+        shards.setdefault(shard, set()).add(name)
+
+    print(f"Loading weights from {len(shards)} shard(s) (low-memory mode)...")
+
+    # Build model parameter map
+    model_params = {name: param for name, param in model.named_parameters()}
+    print(f"Model has {len(model_params)} parameters")
+
+    loaded_count = 0
+    missing_mappings = set()
+    processed_keys = set()
+
+    for shard_idx, (shard_name, names) in enumerate(shards.items()):
+        print(f"  Loading shard {shard_idx + 1}/{len(shards)}: {shard_name}")
+        shard_path = index_file.parent / shard_name
+
+        # Load to CPU first to avoid GPU OOM during dequantization
+        # (safer for large models with limited VRAM)
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for hf_key in names:
+                if hf_key in processed_keys:
+                    continue
+
+                # Skip _scales keys - they're handled together with _blocks
+                if hf_key.endswith("_scales"):
+                    processed_keys.add(hf_key)
+                    continue
+
+                # Determine the base key and whether it's quantized
+                is_quantized = hf_key.endswith("_blocks")
+                base_hf_key = hf_key[:-7] if is_quantized else hf_key
+
+                # Map HF key to official model parameter name
+                official_key = _map_hf_key_to_official(base_hf_key)
+
+                if not official_key:
+                    processed_keys.add(hf_key)
+                    continue
+
+                if official_key not in model_params:
+                    missing_mappings.add(f"{base_hf_key} -> {official_key}")
+                    processed_keys.add(hf_key)
+                    if is_quantized:
+                        processed_keys.add(base_hf_key + "_scales")
+                    continue
+
+                # Load the tensor
+                if is_quantized:
+                    # Load and dequantize quantized weights
+                    scales_key = base_hf_key + "_scales"
+                    blocks = f.get_tensor(hf_key)
+                    scales = f.get_tensor(scales_key)
+                    tensor = dequantize_mxfp4(blocks, scales, dtype=torch.bfloat16)
+                    del blocks, scales
+                    processed_keys.add(hf_key)
+                    processed_keys.add(scales_key)
+                else:
+                    # Load regular unquantized weights
+                    tensor = f.get_tensor(hf_key)
+                    processed_keys.add(hf_key)
+
+                # Copy tensor into model parameter
+                param = model_params[official_key]
+                if tensor.shape == param.shape:
+                    param.data.copy_(tensor.to(device))
+                    loaded_count += 1
+                else:
+                    print(f"  Warning: Shape mismatch for {official_key}: {tensor.shape} vs {param.shape}")
+
+                del tensor
+
+    print(f"✓ Loaded {loaded_count} tensors into model")
+
+    if missing_mappings:
+        print(f"⚠ Warning: {len(missing_mappings)} keys could not be mapped to model parameters")
+        if len(missing_mappings) <= 10:
+            for mapping in sorted(missing_mappings)[:10]:
+                print(f"  - {mapping}")
+
+    # Check what wasn't loaded
+    loaded_params = set()
+    for hf_key in processed_keys:
+        if hf_key.endswith("_scales"):
+            continue
+        # Strip _blocks suffix if present before mapping
+        base_key = hf_key[:-7] if hf_key.endswith("_blocks") else hf_key
+        official_key = _map_hf_key_to_official(base_key)
+        if official_key:
+            loaded_params.add(official_key)
+
+    unloaded = set(model_params.keys()) - loaded_params
+    if unloaded:
+        print(f"⚠ Warning: {len(unloaded)} model parameters were not loaded")
+        for param_name in sorted(unloaded)[:5]:
+            print(f"  - {param_name}")
+
+
+def _map_hf_key_to_official(hf_key: str) -> Optional[str]:
+    """Map a single HF key to official format."""
+    # Embedding and output layers
+    if hf_key == "model.embed_tokens.weight":
+        return "embedding.weight"
+    if hf_key == "model.norm.weight":
+        return "norm.scale"
+    if hf_key == "lm_head.weight":
+        return "unembedding.weight"
+
+    # Transformer layers
+    if not hf_key.startswith("model.layers."):
+        return None
+
+    remainder = hf_key[len("model.layers."):]
+    parts = remainder.split(".", 1)
+    if len(parts) < 2:
+        return None
+
+    layer_idx, sub = parts
+    base = f"block.{layer_idx}."
+
+    # Map attention weights
+    mapping = {
+        "input_layernorm.weight": "attn.norm.scale",
+        "self_attn.q_proj.weight": "attn.q_proj.weight",
+        "self_attn.q_proj.bias": "attn.q_proj.bias",
+        "self_attn.k_proj.weight": "attn.k_proj.weight",
+        "self_attn.k_proj.bias": "attn.k_proj.bias",
+        "self_attn.v_proj.weight": "attn.v_proj.weight",
+        "self_attn.v_proj.bias": "attn.v_proj.bias",
+        "self_attn.o_proj.weight": "attn.out.weight",
+        "self_attn.o_proj.bias": "attn.out.bias",
+        "self_attn.sinks": "attn.sink_logits",
+        "post_attention_layernorm.weight": "mlp.norm.scale",
+        "mlp.router.weight": "mlp.gate.weight",
+        "mlp.router.bias": "mlp.gate.bias",
+        "mlp.experts.gate_up_proj": "mlp.mlp1_weight",
+        "mlp.experts.gate_up_proj_bias": "mlp.mlp1_bias",
+        "mlp.experts.down_proj": "mlp.mlp2_weight",
+        "mlp.experts.down_proj_bias": "mlp.mlp2_bias",
+    }
+
+    if sub in mapping:
+        return base + mapping[sub]
+
+    return None
 
 
 # ============================================================================
@@ -265,6 +424,15 @@ class GPTOSS(nn.Module):
         weights_path = model_cfg.get("weights")
         if weights_path:
             weights_path = Path(weights_path)
+            # Make path absolute if it's relative
+            if not weights_path.is_absolute():
+                # Try to resolve relative to current working directory
+                if not weights_path.exists():
+                    # If not found, try relative to project root (parent of models/)
+                    project_root = Path(__file__).parent.parent.parent
+                    alt_path = project_root / weights_path
+                    if alt_path.exists():
+                        weights_path = alt_path
             device = next(model.parameters()).device
             load_gpt_oss_weights(model.backbone, weights_path, device)
 

@@ -15,15 +15,16 @@ from typing import Dict
 import torch
 
 
-def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Dequantize MXFP4 quantized weights to float32.
+def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """Dequantize MXFP4 quantized weights to specified dtype.
 
     Args:
         blocks: Quantized 4-bit blocks [..., num_blocks, 16] (uint8)
         scales: Scaling factors [..., num_blocks] (uint8)
+        dtype: Target dtype (default: bfloat16 for memory efficiency)
 
     Returns:
-        Dequantized weights in float32 with shape [..., num_blocks * 32]
+        Dequantized weights with shape [..., num_blocks * 32]
     """
     # Unpack 4-bit values from uint8 blocks
     # Each uint8 contains 2 4-bit values
@@ -39,6 +40,7 @@ def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     is_zero = (exponent == 0) & (mantissa == 0)
     is_subnormal = (exponent == 0) & (mantissa == 1)
 
+    # Use float32 for intermediate calculations, convert to target dtype at the end
     subnormal = torch.full_like(packed, 0.25, dtype=torch.float32)
     normal = torch.pow(2.0, exponent.to(torch.float32) - 1.0) * (1.0 + mantissa.to(torch.float32) * 0.5)
     values = torch.where(is_zero, torch.zeros_like(normal), torch.where(is_subnormal, subnormal, normal))
@@ -54,15 +56,19 @@ def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 
     # Flatten the last two dimensions (num_blocks, 32) -> (num_blocks * 32)
     new_shape = list(values.shape[:-2]) + [-1]
-    return values.reshape(new_shape)
+    result = values.reshape(new_shape)
+
+    # Convert to target dtype (bfloat16 uses 2x less memory than float32)
+    return result.to(dtype)
 
 
-def load_safetensors_sharded(index_path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
+def load_safetensors_sharded(index_path: Path, device: torch.device, max_memory_gb: float = None) -> Dict[str, torch.Tensor]:
     """Load sharded safetensors checkpoint with MXFP4 dequantization.
 
     Args:
         index_path: Path to model.safetensors.index.json
         device: Device to load tensors on
+        max_memory_gb: Maximum memory to use in GB (optional, for memory-efficient loading)
 
     Returns:
         Dictionary of parameter name -> tensor
@@ -80,15 +86,21 @@ def load_safetensors_sharded(index_path: Path, device: torch.device) -> Dict[str
     for name, shard in weight_map.items():
         shards.setdefault(shard, set()).add(name)
 
+    print(f"Loading weights from {len(shards)} shard(s)...")
+
     tensors: Dict[str, torch.Tensor] = {}
     processed_keys = set()  # Track which keys we've already processed
 
-    for shard_name, names in shards.items():
+    for shard_idx, (shard_name, names) in enumerate(shards.items()):
+        print(f"  Loading shard {shard_idx + 1}/{len(shards)}: {shard_name}")
         shard_path = index_path.parent / shard_name
         if not shard_path.exists():
             raise FileNotFoundError(f"Shard {shard_name} not found at {shard_path}")
 
-        with safe_open(shard_path, framework="pt", device=str(device)) as f:
+        # Load directly to CPU first to avoid OOM, then move to target device
+        load_device = "cpu" if str(device) != "cpu" else str(device)
+
+        with safe_open(shard_path, framework="pt", device=load_device) as f:
             for key in names:
                 if key in processed_keys:
                     continue
@@ -100,16 +112,24 @@ def load_safetensors_sharded(index_path: Path, device: torch.device) -> Dict[str
 
                     blocks = f.get_tensor(key)
                     scales = f.get_tensor(scales_key)
-                    tensors[base] = dequantize_mxfp4(blocks, scales).to(device)
+                    # Dequantize on CPU, then move to device
+                    dequant = dequantize_mxfp4(blocks, scales)
+                    tensors[base] = dequant.to(device)
+
+                    # Free CPU memory immediately
+                    del blocks, scales, dequant
 
                     # Mark both _blocks and _scales as processed
                     processed_keys.add(key)
                     processed_keys.add(scales_key)
                 elif not key.endswith("_scales"):
                     # Regular weight (not quantized)
-                    tensors[key] = f.get_tensor(key).to(device)
+                    tensor = f.get_tensor(key)
+                    tensors[key] = tensor.to(device)
+                    del tensor
                     processed_keys.add(key)
 
+    print(f"✓ Loaded {len(tensors)} tensors")
     return tensors
 
 
