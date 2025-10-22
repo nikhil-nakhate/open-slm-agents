@@ -1,7 +1,6 @@
 extends: gpt2_base
 
 model:
-  name: gpt2
   modules:
     transformer:
       dim: 1024           # emb_dim

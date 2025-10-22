@@ -20,10 +20,13 @@ setup(
         "accelerate>=0.20.0",
         "bitsandbytes>=0.41.0",
         "flash-attn>=2.0.0",
+        "huggingface-hub>=0.20.0",
+        "datasets>=2.14.0",
+        "python-dotenv>=1.0.0",
     ],
     extras_require={
         # Hugging Face tokenizer/model support
-        "hf": ["transformers>=4.40"],
+        "hf": ["transformers>=4.40", "huggingface-hub>=0.20.0", "datasets>=2.14.0"],
         # Logging backends
         "wandb": ["wandb>=0.15"],
         "tb": ["tensorboard>=2.11"],
@@ -32,7 +35,7 @@ setup(
         # Developer tools
         "dev": ["black>=23.0", "flake8>=6.0"],
         # Everything optional
-        "all": ["transformers>=4.40", "wandb>=0.15", "tensorboard>=2.11", "pytest>=7.0.0", "pytest-cov>=4.0.0"],
+        "all": ["transformers>=4.40", "huggingface-hub>=0.20.0", "datasets>=2.14.0", "wandb>=0.15", "tensorboard>=2.11", "pytest>=7.0.0", "pytest-cov>=4.0.0"],
     },
     entry_points={
         "console_scripts": [

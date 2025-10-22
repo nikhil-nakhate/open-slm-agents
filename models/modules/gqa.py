@@ -1,109 +1,159 @@
-from typing import Optional
+"""Attention module with Grouped Query Attention and sink tokens.
+
+This module implements the attention mechanism with:
+- Grouped Query Attention (GQA) with configurable ratio
+- YaRN scaled Rotary Position Embeddings (RoPE)
+- Sink tokens for attention stability
+- Optional sliding window attention
+"""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
 from .rope import RotaryEmbedding
+from .rms_norm import RMSNorm
 
 
-class GroupedQueryAttention(nn.Module):
-    """Multi-head attention that shares key/value heads across query heads (GQA)."""
+def causal_attention_with_sinks(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sink_logits: torch.Tensor,
+    scale: float,
+    sliding_window: int,
+) -> torch.Tensor:
+    """Causal attention with sink tokens and optional sliding window.
+
+    Args:
+        q: Query tensor [n_tokens, n_heads, q_mult, head_dim]
+        k: Key tensor [n_tokens, n_heads, head_dim]
+        v: Value tensor [n_tokens, n_heads, head_dim]
+        sink_logits: Sink token logits [n_heads]
+        scale: Attention scale factor (1/sqrt(head_dim))
+        sliding_window: Sliding window size (0 = no window)
+
+    Returns:
+        Attention output [n_tokens, n_heads * q_mult * head_dim]
+    """
+    n_tokens, n_heads, q_mult, head_dim = q.shape
+    assert k.shape == (n_tokens, n_heads, head_dim)
+    assert v.shape == (n_tokens, n_heads, head_dim)
+
+    # Expand k, v for grouped query attention
+    k = k[:, :, None, :].expand(-1, -1, q_mult, -1)
+    v = v[:, :, None, :].expand(-1, -1, q_mult, -1)
+    sinks = sink_logits.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, 1)
+
+    # Causal mask (use q's dtype for consistency)
+    mask = torch.triu(
+        torch.full((n_tokens, n_tokens), float("-inf"), device=q.device, dtype=q.dtype),
+        diagonal=1,
+    )
+
+    # Sliding window mask
+    if sliding_window > 0:
+        mask += torch.tril(torch.full_like(mask, float("-inf")), diagonal=-sliding_window)
+
+    # Attention scores
+    attn = torch.einsum("qhmd,khmd->hmqk", q, k) * scale
+    attn = attn + mask.unsqueeze(0).unsqueeze(0)
+    attn = torch.cat([attn, sinks], dim=-1)
+    weights = torch.softmax(attn.to(torch.float32), dim=-1).to(q.dtype)[..., :-1]
+    out = torch.einsum("hmqk,khmd->qhmd", weights, v)
+
+    return out.reshape(n_tokens, -1)
+
+
+class AttentionBlock(nn.Module):
+    """Grouped query attention with RoPE and sink tokens.
+
+    This implements the attention mechanism with:
+    - Configurable GQA ratio (num_attention_heads / num_key_value_heads)
+    - YaRN scaled rotary position embeddings
+    - Sink tokens for stability
+    - Optional sliding window
+    """
 
     def __init__(
         self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
         head_dim: int,
-        context_length: int,
-        dropout: float = 0.0,
-        qkv_bias: bool = False,
-        rope: Optional[RotaryEmbedding] = None,
-        sliding_window: Optional[int] = None,
-        sink_init: float = 0.0,
+        layer_idx: int,
+        max_position_embeddings: int,
+        rope_theta: float,
+        rope_scaling_factor: float,
+        rope_ntk_alpha: float,
+        rope_ntk_beta: float,
+        sliding_window: int,
+        rms_norm_eps: float,
+        dtype: torch.dtype,
     ) -> None:
+        """Initialize attention block.
+
+        Args:
+            hidden_size: Hidden dimension size
+            num_attention_heads: Number of attention heads
+            num_key_value_heads: Number of key/value heads (for GQA)
+            head_dim: Dimension of each attention head
+            layer_idx: Layer index (for sliding window)
+            max_position_embeddings: Maximum sequence length
+            rope_theta: RoPE base frequency
+            rope_scaling_factor: YaRN scaling factor
+            rope_ntk_alpha: YaRN NTK alpha parameter
+            rope_ntk_beta: YaRN NTK beta parameter
+            sliding_window: Sliding window size (applied to even layers)
+            rms_norm_eps: RMSNorm epsilon
+            dtype: Data type for parameters
+        """
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("dim must be divisible by num_heads")
-        if num_heads % max(1, num_kv_heads) != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
-
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
-        self.q_proj = nn.Linear(dim, num_heads * head_dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, num_kv_heads * head_dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, num_kv_heads * head_dim, bias=qkv_bias)
-        self.out_proj = nn.Linear(num_heads * head_dim, dim, bias=True)
-        self.dropout = nn.Dropout(dropout)
-        self.rope = rope
+        self.num_heads = num_attention_heads
+        self.num_kv_heads = num_key_value_heads
+        self.q_per_kv = self.num_heads // self.num_kv_heads
+        self.sliding_window = sliding_window if layer_idx % 2 == 0 else 0
+        self.scale = 1 / (head_dim ** 0.5)
 
-        mask = torch.triu(torch.full((context_length, context_length), float("-inf")), diagonal=1)
-        if sliding_window is not None and sliding_window > 0:
-            mask += torch.tril(torch.full_like(mask, float("-inf")), diagonal=-sliding_window)
-        self.register_buffer("attn_mask", mask, persistent=False)
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.q_proj = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=True, dtype=dtype)
+        self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=True, dtype=dtype)
+        self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=True, dtype=dtype)
+        self.out = nn.Linear(self.head_dim * self.num_heads, hidden_size, bias=True, dtype=dtype)
+        self.sink_logits = nn.Parameter(torch.empty(self.num_heads, dtype=torch.bfloat16))
+        nn.init.zeros_(self.sink_logits)
 
-        self.register_parameter(
-            "sink_logits", nn.Parameter(torch.full((num_heads,), sink_init, dtype=torch.float32))
+        self.rotary = RotaryEmbedding(
+            head_dim=head_dim,
+            base=rope_theta,
+            scaling_factor=rope_scaling_factor,
+            initial_context_length=max_position_embeddings,
+            ntk_alpha=rope_ntk_alpha,
+            ntk_beta=rope_ntk_beta,
         )
-
-    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.rope is None:
-            return q, k
-        return self.rope(q, k)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError("Expected input tensor with shape [batch, seq_len, dim]")
-        bsz, seq_len, _ = x.shape
-        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        """Forward pass with residual connection.
 
-        q_t = q.permute(0, 2, 1, 3)
-        k_t = k.permute(0, 2, 1, 3)
-        q_t, k_t = self._apply_rope(q_t, k_t)
-        q = q_t.permute(0, 2, 1, 3)
-        k = k_t.permute(0, 2, 1, 3)
+        Args:
+            x: Input tensor [batch, seq_len, hidden_size]
 
-        q_mult = self.num_heads // self.num_kv_heads
-        q = q.view(bsz, seq_len, self.num_kv_heads, q_mult, self.head_dim)
+        Returns:
+            Output tensor [batch, seq_len, hidden_size]
+        """
+        residual = x
+        h = self.norm(x)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
+        v = self.v_proj(h)
 
-        mask = self.attn_mask[:seq_len, :seq_len].to(x.dtype).to(x.device)
+        q = q.view(-1, self.num_kv_heads, self.q_per_kv, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        outputs = []
-        for b in range(bsz):
-            q_b = q[b].view(seq_len, self.num_kv_heads, q_mult, self.head_dim)
-            k_b = k[b]
-            v_b = v[b]
-            context = self._sdpa(q_b, k_b, v_b, mask, q_mult)
-            outputs.append(context)
+        q, k = self.rotary(q, k)
+        attn = causal_attention_with_sinks(q, k, v, self.sink_logits, self.scale, self.sliding_window)
 
-        context = torch.stack(outputs, dim=0)  # [B, seq_len, num_heads * head_dim]
-        context = context.view(bsz, seq_len, self.num_heads * self.head_dim)
-        return self.out_proj(context)
-
-    def _sdpa(
-        self,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        mask: torch.Tensor,
-        q_mult: int,
-    ) -> torch.Tensor:
-        n_tokens = Q.shape[0]
-        K_exp = K.unsqueeze(2).expand(-1, -1, q_mult, -1)
-        V_exp = V.unsqueeze(2).expand(-1, -1, q_mult, -1)
-        sinks = (
-            self.sink_logits.view(self.num_kv_heads, q_mult, 1, 1)
-            .to(Q.dtype)
-            .expand(-1, -1, n_tokens, -1)
-        )
-        scores = torch.einsum("qhmd,khmd->hmqk", Q, K_exp) * self.scale
-        scores = scores + mask.unsqueeze(0).unsqueeze(0).to(Q.dtype)
-        scores = torch.cat([scores, sinks], dim=-1)
-        weights = torch.softmax(scores, dim=-1)[..., :-1]
-        weights = self.dropout(weights)
-        attn = torch.einsum("hmqk,khmd->qhmd", weights, V_exp)
-        return attn.reshape(n_tokens, self.num_heads * self.head_dim)
+        return residual + self.out(attn)

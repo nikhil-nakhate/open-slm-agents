@@ -1,6 +1,5 @@
 from typing import List, Dict, Any, Optional
 import os
-import re
 import tiktoken
 
 
@@ -71,40 +70,6 @@ class SimpleCharTokenizer(BaseTokenizer):
         return None
 
 
-class RegexWordTokenizer(BaseTokenizer):
-    """A simple regex-based word tokenizer with a small dynamic vocab.
-
-    Not suitable for large corpora, but OK for quick tests.
-    """
-
-    def __init__(self):
-        # Do not bake PAD into vocab; reserve last index for PAD
-        self.stoi = {"<unk>": 0}
-        self.itos = ["<unk>"]
-        self._word_re = re.compile(r"\w+|[^\w\s]")
-
-    def encode(self, text: str) -> List[int]:
-        ids = []
-        for tok in self._word_re.findall(text):
-            if tok not in self.stoi:
-                self.stoi[tok] = len(self.itos)
-                self.itos.append(tok)
-            ids.append(self.stoi.get(tok, 0))
-        return ids
-
-    def decode(self, ids: List[int]) -> str:
-        toks = []
-        pad = self.pad_id
-        for i in ids:
-            if i == pad:
-                continue
-            toks.append(self.itos[i] if 0 <= i < len(self.itos) else "<unk>")
-        return " ".join(toks).strip()
-
-    @property
-    def vocab_size(self) -> int:
-        # +1 slot reserved for PAD at the end
-        return len(self.itos) + 1
 
 
 def build_tokenizer(cfg: Dict[str, Any]) -> BaseTokenizer:
@@ -113,47 +78,16 @@ def build_tokenizer(cfg: Dict[str, Any]) -> BaseTokenizer:
 
     if kind == "simple_char":
         return SimpleCharTokenizer(**params)
-    elif kind == "regex_word":
-        return RegexWordTokenizer()
-    elif kind in {"tiktoken", "tiktoken_gpt2"}:
-        name = params.get("name", "gpt2")
-        enc = tiktoken.get_encoding(name)
+    elif kind == "o200k_harmony":
+        return HarmonyTokenizer()
+    elif kind == "tiktoken":
+        # Always uses gpt2 encoding
+        enc = tiktoken.get_encoding("gpt2")
         return TiktokenTokenizer(enc)
-    elif kind in {"hf_gpt2", "huggingface"}:
-        from transformers import GPT2TokenizerFast  # type: ignore
-        name = params.get("name", "gpt2")
-        add_prefix_space = params.get("add_prefix_space", True)
-        tok = GPT2TokenizerFast.from_pretrained(name, add_prefix_space=add_prefix_space)
-        return HFTokenizer(tok)
-
     else:
         raise ValueError(f"Unknown tokenizer kind: {kind}")
 
 
-class HFTokenizer(BaseTokenizer):
-    """Wraps a HuggingFace tokenizer to match BaseTokenizer interface."""
-
-    def __init__(self, tok):
-        self.tok = tok
-
-    def encode(self, text: str) -> List[int]:
-        return self.tok.encode(text)
-
-    def decode(self, ids: List[int]) -> str:
-        return self.tok.decode(ids)
-
-    @property
-    def vocab_size(self) -> int:
-        return self.tok.vocab_size
-
-    @property
-    def pad_id(self) -> int:
-        # Always reserve last id for padding
-        return self.tok.vocab_size - 1
-
-    @property
-    def eos_id(self) -> Optional[int]:
-        return getattr(self.tok, "eos_token_id", None)
 
 
 class TiktokenTokenizer(BaseTokenizer):
@@ -166,6 +100,66 @@ class TiktokenTokenizer(BaseTokenizer):
 
     def encode(self, text: str) -> List[int]:
         return self.encoding.encode(text, allowed_special={"<|endoftext|>"})
+
+    def decode(self, ids: List[int]) -> str:
+        # Skip pad ids (reserved as the last vocab index)
+        pad = self.pad_id
+        filtered = [i for i in ids if i != pad]
+        return self.encoding.decode(filtered)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self.encoding.n_vocab)
+
+    @property
+    def eos_id(self) -> Optional[int]:
+        return self._eos
+
+
+class HarmonyTokenizer(BaseTokenizer):
+    """Harmony tokenizer with extended special tokens.
+
+    Based on the o200k_base encoding with additional special tokens for
+    structured text generation and control.
+    """
+
+    def __init__(self):
+        # Get the base o200k encoding
+        o200k_base = tiktoken.get_encoding("o200k_base")
+
+        # Create the harmony encoding with extended special tokens
+        self.encoding = tiktoken.Encoding(
+            name="o200k_harmony",
+            pat_str=o200k_base._pat_str,
+            mergeable_ranks=o200k_base._mergeable_ranks,
+            special_tokens={
+                **o200k_base._special_tokens,
+                "<|startoftext|>": 199998,
+                "<|endoftext|>": 199999,
+                "<|reserved_200000|>": 200000,
+                "<|reserved_200001|>": 200001,
+                "<|return|>": 200002,
+                "<|constrain|>": 200003,
+                "<|reserved_200004|>": 200004,
+                "<|channel|>": 200005,
+                "<|start|>": 200006,
+                "<|end|>": 200007,
+                "<|message|>": 200008,
+                "<|reserved_200009|>": 200009,
+                "<|reserved_200010|>": 200010,
+                "<|reserved_200011|>": 200011,
+                "<|call|>": 200012,
+            } | {
+                f"<|reserved_{i}|>": i for i in range(200013, 201088)
+            },
+        )
+
+        # Compute eos id via special token
+        self._eos = self.encoding.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
+
+    def encode(self, text: str) -> List[int]:
+        # Allow all special tokens during encoding
+        return self.encoding.encode(text, allowed_special="all")
 
     def decode(self, ids: List[int]) -> str:
         # Skip pad ids (reserved as the last vocab index)

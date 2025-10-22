@@ -1,0 +1,39 @@
+model:
+  name: gpt_oss
+
+  # GPT-OSS 20B parameters (matches official implementation)
+  params:
+    vocab_size: 201088
+    hidden_size: 2880
+    num_hidden_layers: 24
+    num_attention_heads: 64
+    num_key_value_heads: 8
+    head_dim: 64
+    intermediate_size: 2880
+    num_experts: 32
+    experts_per_token: 4
+    swiglu_limit: 7.0
+    max_position_embeddings: 131072
+    rope_theta: 150000.0
+    rope_scaling_factor: 32.0
+    rope_ntk_alpha: 1.0
+    rope_ntk_beta: 32.0
+    sliding_window: 128
+    rms_norm_eps: 0.00001
+    dtype: bfloat16
+
+  # Tokenizer configuration
+  modules:
+    tokenizer:
+      kind: o200k_harmony
+
+  # Path to weights directory (contains model.safetensors.index.json and shards)
+  weights: weights/gpt-oss-20b
+
+# Generation parameters
+eval:
+  max_new_tokens: 256
+  temperature: 0.7
+  top_k: 0
+  top_p: 0.95
+  greedy: false

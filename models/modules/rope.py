@@ -1,3 +1,11 @@
+"""Rotary Position Embedding (RoPE) with YaRN scaling.
+
+This implementation supports:
+- Standard RoPE for positional encoding
+- YaRN scaling for extended context length
+- NTK-by-parts interpolation/extrapolation
+"""
+
 import math
 from typing import Tuple
 
@@ -5,46 +13,68 @@ import torch
 import torch.nn as nn
 
 
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary position embedding.
+
+    Args:
+        x: Input tensor of shape [n_tokens, n_heads, head_dim] or [n_tokens, n_heads, q_mult, head_dim]
+        cos: Cosine values [n_tokens, head_dim//2]
+        sin: Sine values [n_tokens, head_dim//2]
+
+    Returns:
+        Rotated tensor
+    """
+    # Add dimension for broadcasting
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+
+    # Split into first and second half
+    x1, x2 = x.chunk(2, dim=-1)
+
+    # Apply rotation
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+
+    return torch.cat((o1, o2), dim=-1)
+
+
 class RotaryEmbedding(nn.Module):
-    """Rotary position embeddings (RoPE) with optional YaRN scaling."""
+    """Rotary position embeddings (RoPE) with YaRN scaling."""
 
     def __init__(
         self,
         head_dim: int,
-        base: float = 10000.0,
-        *,
+        base: float,
         scaling_factor: float = 1.0,
         initial_context_length: int = 4096,
         ntk_alpha: float = 1.0,
         ntk_beta: float = 32.0,
-        dtype: torch.dtype = torch.float32,
+        device: torch.device | None = None,
     ) -> None:
         super().__init__()
-        if head_dim % 2 != 0:
-            raise ValueError("RotaryEmbedding requires an even head_dim")
         self.head_dim = head_dim
-        self.base = float(base)
-        self.scaling_factor = float(scaling_factor)
-        self.initial_context_length = int(initial_context_length)
-        self.ntk_alpha = float(ntk_alpha)
-        self.ntk_beta = float(ntk_beta)
-        self.dtype = dtype
-        self.register_buffer(
-            "inv_freq_base",
-            torch.arange(0, head_dim, 2, dtype=torch.float32),
-            persistent=False,
+        self.base = base
+        self.scaling_factor = scaling_factor
+        self.initial_context_length = initial_context_length
+        self.ntk_alpha = ntk_alpha
+        self.ntk_beta = ntk_beta
+        self.device = device
+
+    def _compute_concentration_and_inv_freq(self) -> Tuple[float, torch.Tensor]:
+        """Compute concentration factor and inverse frequencies for YaRN scaling.
+
+        See YaRN paper: https://arxiv.org/abs/2309.00071
+        """
+        freq = self.base ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device) / self.head_dim
         )
 
-    def _compute_concentration_and_inv_freq(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        freq = self.base ** (self.inv_freq_base.to(device) / self.head_dim)
         if self.scaling_factor > 1.0:
-            concentration = torch.tensor(
-                0.1 * math.log(self.scaling_factor) + 1.0,
-                device=device,
-                dtype=torch.float32,
-            )
+            # YaRN concentration
+            concentration = 0.1 * math.log(self.scaling_factor) + 1.0
 
             d_half = self.head_dim / 2
+            # NTK by parts boundaries
             low = (
                 d_half
                 * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
@@ -55,36 +85,50 @@ class RotaryEmbedding(nn.Module):
                 * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi))
                 / math.log(self.base)
             )
-            if not (0 < low < high < d_half - 1):
-                raise ValueError("Invalid YaRN configuration for rotary embedding scaling.")
 
+            # Interpolation and extrapolation
             interpolation = 1.0 / (self.scaling_factor * freq)
             extrapolation = 1.0 / freq
 
-            ramp = (torch.arange(d_half, device=device) - low) / (high - low)
+            # Smooth transition ramp
+            ramp = (torch.arange(d_half, device=freq.device) - low) / (high - low)
             mask = 1 - ramp.clamp(0, 1)
+
             inv_freq = interpolation * (1 - mask) + extrapolation * mask
         else:
-            concentration = torch.tensor(1.0, device=device, dtype=torch.float32)
+            concentration = 1.0
             inv_freq = 1.0 / freq
 
         return concentration, inv_freq
 
-    def _build_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        concentration, inv_freq = self._compute_concentration_and_inv_freq(device)
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = (freqs.cos() * concentration).to(dtype)
-        sin = (freqs.sin() * concentration).to(dtype)
-        return cos, sin
-
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_len = q.shape[-2]
-        cos, sin = self._build_cache(seq_len, q.device, q.dtype)
-        cos = cos.unsqueeze(0).unsqueeze(0)
-        sin = sin.unsqueeze(0).unsqueeze(0)
-        q1, q2 = torch.chunk(q, 2, dim=-1)
-        k1, k2 = torch.chunk(k, 2, dim=-1)
-        q = torch.cat((q1 * cos - q2 * sin, q2 * cos + q1 * sin), dim=-1)
-        k = torch.cat((k1 * cos - k2 * sin, k2 * cos + k1 * sin), dim=-1)
+        """Apply rotary embeddings to query and key tensors.
+
+        Args:
+            q: Query tensor [n_tokens, n_heads, (q_mult), head_dim]
+            k: Key tensor [n_tokens, n_heads, head_dim]
+
+        Returns:
+            Tuple of (rotated_q, rotated_k)
+        """
+        num_tokens = q.shape[0]
+        concentration, inv_freq = self._compute_concentration_and_inv_freq()
+
+        # Build position encodings
+        t = torch.arange(num_tokens, dtype=torch.float32, device=q.device)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        cos = freqs.cos() * concentration
+        sin = freqs.sin() * concentration
+
+        # Apply to q and k
+        q_shape = q.shape
+        q = q.view(num_tokens, -1, self.head_dim)
+        q = apply_rotary_emb(q, cos, sin)
+        q = q.reshape(q_shape)
+
+        k_shape = k.shape
+        k = k.view(num_tokens, -1, self.head_dim)
+        k = apply_rotary_emb(k, cos, sin)
+        k = k.reshape(k_shape)
+
         return q, k

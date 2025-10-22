@@ -8,7 +8,6 @@ model:
   modules:
     tokenizer:
       kind: simple_char
-      params: {}
       freeze: false
     
     token_embedding:

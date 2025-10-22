@@ -1,116 +1,122 @@
-from typing import Optional
+"""MLP module with Mixture of Experts (MoE).
+
+This module implements the MLP layer with MoE, featuring:
+- Mixture of Experts with configurable number of experts
+- Top-k expert routing per token
+- SwiGLU activation with clamping
+- Support for quantized expert weights (MXFP4)
+"""
+
+from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
-from .activations import SwiGLU
 from .rms_norm import RMSNorm
 
 
-class MoEMLP(nn.Module):
-    """Mixture-of-experts feed-forward layer with SwiGLU experts."""
+class MLPBlock(nn.Module):
+    """Mixture-of-Experts MLP with SwiGLU activation.
+
+    This implements the MoE MLP with:
+    - Configurable number of experts
+    - Top-k routing per token
+    - SwiGLU activation (clamped to prevent overflow)
+    - Support for tensor parallelism (sharded across ranks)
+    """
 
     def __init__(
         self,
-        dim: int,
+        hidden_size: int,
         intermediate_size: int,
         num_experts: int,
         experts_per_token: int,
-        swiglu_limit: float = 7.0,
-        dropout: float = 0.0,
-        normalized_input: bool = True,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
+        swiglu_limit: float,
+        rms_norm_eps: float,
+        dtype: torch.dtype,
     ) -> None:
+        """Initialize MLP block.
+
+        Args:
+            hidden_size: Hidden dimension size
+            intermediate_size: Intermediate dimension size (before sharding)
+            num_experts: Total number of experts
+            experts_per_token: Number of experts to route each token to
+            swiglu_limit: Clamping limit for SwiGLU activation
+            rms_norm_eps: RMSNorm epsilon
+            dtype: Data type for parameters
+        """
         super().__init__()
-        self.dim = dim
-        self.hidden_size = intermediate_size
         self.num_experts = num_experts
         self.experts_per_token = experts_per_token
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+        assert self.intermediate_size % self.world_size == 0
+        hidden_per_rank = self.intermediate_size // self.world_size
+
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.gate = nn.Linear(hidden_size, num_experts, bias=True, dtype=dtype)
+
+        # Expert weights (sharded across ranks for tensor parallelism)
+        self.mlp1_weight = nn.Parameter(
+            torch.empty(self.num_experts, hidden_per_rank * 2, hidden_size, dtype=torch.bfloat16)
+        )
+        self.mlp1_bias = nn.Parameter(torch.empty(self.num_experts, hidden_per_rank * 2, dtype=torch.bfloat16))
+        self.mlp2_weight = nn.Parameter(
+            torch.empty(self.num_experts, hidden_size, hidden_per_rank, dtype=torch.bfloat16)
+        )
+        self.mlp2_bias = nn.Parameter(torch.empty(self.num_experts, hidden_size, dtype=torch.bfloat16))
         self.swiglu_limit = swiglu_limit
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self.normalize_input = normalized_input
-        if normalized_input:
-            self.input_norm = RMSNorm(dim, device=device)
-        else:
-            self.input_norm = None
-
-        proj_dtype = dtype or torch.float32
-        self.gate = nn.Linear(dim, num_experts, device=device, dtype=proj_dtype)
-        assert intermediate_size % self.world_size == 0, "intermediate_size must divide world_size"
-        hidden_per_rank = intermediate_size // self.world_size
-
-        self.expert_ff1 = nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_per_rank * 2,
-                dim,
-                device=device,
-                dtype=proj_dtype,
-            )
-        )
-        self.expert_ff1_bias = nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_per_rank * 2,
-                device=device,
-                dtype=proj_dtype,
-            )
-        )
-        self.expert_ff2 = nn.Parameter(
-            torch.empty(
-                num_experts,
-                dim,
-                hidden_per_rank,
-                device=device,
-                dtype=proj_dtype,
-            )
-        )
-        self.expert_ff2_bias = nn.Parameter(
-            torch.empty(
-                num_experts,
-                dim,
-                device=device,
-                dtype=proj_dtype,
-            )
-        )
-        self.activation = SwiGLU(limit=swiglu_limit)
-        self.dropout = nn.Dropout(dropout)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.expert_ff1)
-        nn.init.zeros_(self.expert_ff1_bias)
-        nn.init.xavier_uniform_(self.expert_ff2)
-        nn.init.zeros_(self.expert_ff2_bias)
-        nn.init.zeros_(self.gate.bias)
-        nn.init.xavier_uniform_(self.gate.weight)
-        if self.input_norm is not None:
-            nn.init.ones_(self.input_norm.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with residual connection.
+
+        Args:
+            x: Input tensor [batch, seq_len, hidden_size]
+
+        Returns:
+            Output tensor [batch, seq_len, hidden_size]
+        """
+        residual = x
         orig_shape = x.shape
-        tokens = x.view(-1, self.dim)
-        if self.input_norm is not None:
-            tokens = self.input_norm(tokens)
+        t = self.norm(x)
 
-        gate_scores = self.gate(tokens)
-        topk = torch.topk(gate_scores, k=self.experts_per_token, dim=-1, sorted=True)
-        weights = torch.softmax(topk.values, dim=-1)
-        indices = topk.indices
+        # Flatten batch and sequence dimensions for MoE processing
+        t = t.view(-1, self.hidden_size)  # (B*T, hidden)
 
-        ff1_weight = self.expert_ff1[indices, ...]
-        ff1_bias = self.expert_ff1_bias[indices, ...]
-        hidden = torch.einsum("behd,bd->beh", ff1_weight, tokens) + ff1_bias
-        hidden = self.activation(hidden)
+        # Expert routing
+        g = self.gate(t)
+        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+        expert_weights = torch.nn.functional.softmax(experts.values, dim=-1)
+        expert_indices = experts.indices
 
-        ff2_weight = self.expert_ff2[indices, ...]
-        ff2_bias = self.expert_ff2_bias[indices, ...]
-        updates = torch.einsum("bedh,beh->bed", ff2_weight, hidden)
+        # MLP #1 - Use einsum to keep token-expert structure
+        mlp1_weight = self.mlp1_weight[expert_indices, ...]  # (B*T, experts_per_token, 2*intermediate, hidden)
+        mlp1_bias = self.mlp1_bias[expert_indices, ...]      # (B*T, experts_per_token, 2*intermediate)
+        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+
+        # SwiGLU activation (interleaved)
+        t_glu, t_linear = t[..., ::2], t[..., 1::2]
+        t_glu = t_glu.clamp(max=self.swiglu_limit)
+        t_linear = t_linear.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        t = t_glu * torch.sigmoid(1.702 * t_glu) * (t_linear + 1)
+
+        # MLP #2
+        mlp2_weight = self.mlp2_weight[expert_indices, ...]  # (B*T, experts_per_token, hidden, intermediate)
+        mlp2_bias = self.mlp2_bias[expert_indices, ...]      # (B*T, experts_per_token, hidden)
+        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
+
         if self.world_size > 1:
-            dist.all_reduce(updates, op=dist.ReduceOp.SUM)
-        updates = updates + ff2_bias
-        updates = torch.einsum("bed,be->bd", updates, weights)
-        updates = updates.view(*orig_shape)
-        return self.dropout(updates)
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+
+        t += mlp2_bias
+
+        # Weighted sum of experts
+        t = torch.einsum("bec,be->bc", t, expert_weights)
+
+        # Reshape back to original batch/sequence dimensions
+        t = t.view(*orig_shape)
+
+        return residual + t

@@ -9,9 +9,6 @@ model:
   modules:
     tokenizer:
       kind: tiktoken
-      params:
-        name: gpt2
-        add_prefix_space: true
       freeze: false
     
     transformer:

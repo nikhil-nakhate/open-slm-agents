@@ -78,7 +78,7 @@ model:
     max_seq_len: 1024        # context length
     dropout: 0.1             # global dropout default
   modules:
-    tokenizer: { kind: hf_gpt2, params: { name: gpt2 } }
+    tokenizer: { kind: tiktoken }
     token_embedding: { freeze: false }
     position_embedding: { freeze: false }
     emb_dropout: { p: 0.1 }
@@ -137,7 +137,7 @@ models/
     losses.py                 # loss builders
 ops/
   config.py                   # YAML loader + extends
-  tokenizer.py                # tokenizers (simple/regex/HF)
+  tokenizer.py                # tokenizers (simple/tiktoken/harmony)
 data/
   dataset.py                  # BaseDataset, TextFileDataset, builder
 metrics/
@@ -156,8 +156,40 @@ eval.py                       # interactive eval CLI
 <a id="datasets-and-crawlers"></a>
 ## 📦 Datasets & Crawlers
 
-- Default `TextFileDataset` consumes `.txt` under `train.data_dir` and chunks to windows.
-- Download remote JSON datasets (SFT/RL/RAG):
+### HuggingFace Datasets
+
+Download datasets from HuggingFace Hub:
+
+```bash
+# Download dataset
+python crawlers/download_hf_dataset.py \
+  --repo-id "tatsu-lab/alpaca" \
+  --category sft
+
+# Download specific split
+python crawlers/download_hf_dataset.py \
+  --repo-id "tatsu-lab/alpaca" \
+  --category sft \
+  --split train
+```
+
+### HuggingFace Models
+
+Download model weights from HuggingFace Hub:
+
+```bash
+# Download entire model
+python crawlers/download_hf_model.py --repo-id "gpt2"
+
+# Download specific file
+python crawlers/download_hf_model.py \
+  --repo-id "gpt2" \
+  --filename "pytorch_model.bin"
+```
+
+### Remote URL Downloads
+
+Download from direct URLs (SFT/RL/RAG):
 
 ```bash
 python crawlers/sample_instruction_data.py \
@@ -166,12 +198,16 @@ python crawlers/sample_instruction_data.py \
   --filename instruction-data.json
 ```
 
-Saved to `data/<category>/<filename>`.
+**Note:** For private HuggingFace datasets/models, set `HUGGINGFACE_TOKEN` in your `.env` file.
+
+Datasets saved to `data/<category>/<filename>`, models to `weights/<model-name>/`.
 
 ---
 
 <a id="converted-gpt-2-weights"></a>
-## 📥 Converted GPT-2 Weights
+## 📥 Model Weights
+
+### GPT-2 Weights (Converted)
 
 ```bash
 # Download + convert
@@ -183,14 +219,40 @@ python eval.py --config gpt2_base --weights_dir weights/gpt2/355M
 
 The loader maps GPT‑2 tensors into our module layout (token/pos embeddings, QKV, MLP, norms, head).
 
+### GPT-OSS 20B Official Weights
+
+Load the official GPT-OSS weights from OpenAI's HuggingFace repository and run them through the refactored modular implementation:
+
+```bash
+# Set your HuggingFace token in .env first
+echo "HUGGINGFACE_TOKEN=your_token_here" >> .env
+
+# Download the safetensors checkpoint
+python scripts/load_gpt_oss_weights.py --repo-id openai/gpt-oss-20b --output-dir weights/gpt-oss-20b
+
+# Update configs/models/gpt_oss_20b.yaml and point `model.weights`
+# to the directory that now contains model.safetensors, then run:
+python infer.py --config configs/models/gpt_oss_20b.yaml
+```
+
+**Features:**
+- 21B parameters (3.6B active with MoE)
+- Mixture of Experts with 32 experts, top-4 routing
+- Grouped Query Attention (64 heads, 8 KV heads)
+- RoPE with YaRN scaling for extended context (131K tokens)
+- Sliding window attention (128 tokens on alternating layers)
+- MXFP4 quantized weights for efficient inference
+
 ---
 
 ## 🛠 Tips & Troubleshooting
 
 - YAML: `pip install pyyaml`
-- HF tokenizer: `pip install transformers`; set `model.modules.tokenizer.kind: hf_gpt2`
+- Tokenizers: `pip install tiktoken` for tiktoken/harmony tokenizers
+- HuggingFace: `pip install huggingface-hub datasets` for downloading HF datasets/models
 - Logging: `pip install -e .[tb]` or `pip install -e .[wandb]`
 - TensorFlow is only needed for GPT‑2 download/conversion scripts.
+- Environment: Copy `.env.example` to `.env` and add your API tokens (HuggingFace, OpenAI, etc.)
 
 ---
 

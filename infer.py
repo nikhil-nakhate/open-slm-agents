@@ -20,6 +20,24 @@ from models.build import build_model_from_cfg
 from ops.agent_utils import load_agent_config, resolve_model_section
 from ops.config import load_config
 from scripts.load_gpt_weights import load_weights_into_gpt
+from models.meta_arch.gpt_oss import GPTOSS, load_gpt_oss_weights
+from ops.harmony import create_simple_prompt, parse_response
+
+# Try to import openai_harmony for proper GPT-OSS inference
+try:
+    from openai_harmony import (
+        Conversation,
+        HarmonyEncodingName,
+        Message,
+        Role,
+        StreamableParser,
+        StreamState,
+        SystemContent,
+        load_harmony_encoding,
+    )
+    HARMONY_AVAILABLE = True
+except ImportError:
+    HARMONY_AVAILABLE = False
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. Answer questions using only the provided context. "
@@ -31,6 +49,8 @@ DEFAULT_PROMPT_TEMPLATE = (
     "Answer:"
 )
 EXIT_COMMANDS = {"/exit", "/quit", ":q", "q"}
+
+HARMONY_TAG_PATTERN = re.compile(r"<\|[^|>]+?\|>")
 
 
 def _sample_next_token(
@@ -65,31 +85,102 @@ def _sample_next_token(
     return int(idx.item())
 
 
-def _generate(
+def _strip_harmony_tokens(text: str) -> str:
+    """Remove Harmony control tokens from decoded text."""
+    return HARMONY_TAG_PATTERN.sub("", text)
+
+
+def _resolve_inference_device(preferred: Optional[str] = None) -> torch.device:
+    """Select the best available device, honoring an explicit preference if provided."""
+    if preferred:
+        try:
+            device = torch.device(preferred)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid preferred device '{preferred}'") from exc
+
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("Requested CUDA device but torch.cuda.is_available() is False")
+
+        if device.type == "mps":
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is None or not getattr(mps_backend, "is_available", lambda: False)():
+                raise ValueError("Requested MPS device but torch.backends.mps.is_available() is False")
+
+        return device
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and getattr(mps_backend, "is_available", lambda: False)():
+        return torch.device("mps")
+
+    return torch.device("cpu")
+
+
+def _generate_stream(
     model,
     tokenizer,
-    prompt: str,
-    device: torch.device,
+    prompt: Optional[str] = None,
+    device: torch.device = None,
     max_new_tokens: int = 200,
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 0.0,
     greedy: bool = False,
-) -> str:
+    autocast_kwargs: Optional[Dict[str, Any]] = None,
+    skip_special_tokens: bool = False,
+    input_tokens: Optional[List[int]] = None,
+):
+    """Generate tokens one at a time, yielding each token ID.
+
+    Args:
+        model: The language model
+        tokenizer: The tokenizer (used only if prompt is provided)
+        prompt: Text prompt to encode (if input_tokens not provided)
+        device: Device to run on
+        max_new_tokens: Maximum number of tokens to generate
+        temperature: Sampling temperature
+        top_k: Top-k sampling
+        top_p: Nucleus sampling
+        greedy: Use greedy decoding
+        autocast_kwargs: Autocasting options
+        skip_special_tokens: Whether to skip Harmony special tokens (deprecated, use parser instead)
+        input_tokens: Pre-encoded token IDs (if provided, prompt is ignored)
+
+    Yields:
+        Generated token IDs (int)
+    """
     model.eval()
     with torch.no_grad():
-        input_ids = tokenizer.encode(prompt)
-        ids = list(input_ids)
-        eos_id: Optional[int] = getattr(tokenizer, "eos_id", None)
+        # Get input token IDs
+        if input_tokens is not None:
+            ids = list(input_tokens)
+        elif prompt is not None:
+            input_ids = tokenizer.encode(prompt)
+            ids = list(input_ids)
+        else:
+            raise ValueError("Either prompt or input_tokens must be provided")
+
+        # GPT-OSS uses multiple EOS tokens
+        eos_tokens = {200002, 199999, 200012, 200007}
+        fallback_eos = getattr(tokenizer, "eos_id", None) if tokenizer else None
+        if fallback_eos is not None:
+            eos_tokens.add(fallback_eos)
+
         max_ctx = int(getattr(model, "max_seq_len", 1024))
 
         x = torch.tensor([ids], dtype=torch.long, device=device)
         for _ in range(max_new_tokens):
             x_cond = x[:, -max_ctx:]
-            logits = model(x_cond)
+            if autocast_kwargs:
+                with torch.autocast(**autocast_kwargs):
+                    logits = model(x_cond)
+            else:
+                logits = model(x_cond)
             next_logits = logits[0, -1, :]
             next_token = _sample_next_token(
-                next_logits,
+                next_logits.float(),
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -97,11 +188,13 @@ def _generate(
             )
             ids.append(next_token)
             x = torch.tensor([ids], dtype=torch.long, device=device)
-            if eos_id is not None and next_token == eos_id:
+
+            # Stop at any EOS token
+            if next_token in eos_tokens:
                 break
 
-        continuation = ids[len(input_ids):]
-        return tokenizer.decode(continuation)
+            # Yield the token ID (caller decides how to decode/filter)
+            yield next_token
 
 
 class LocalResponder:
@@ -112,14 +205,33 @@ class LocalResponder:
         if "model" not in self.cfg:
             raise ValueError("Local responder requires a full model config under 'model'.")
 
+        preferred_device = os.environ.get("INFER_DEVICE") or os.environ.get("DEVICE")
+        self.device = _resolve_inference_device(preferred_device)
+        self.model_dtype: Optional[torch.dtype] = None
+        self.autocast_kwargs: Optional[Dict[str, Any]] = None
+
         self.model = build_model_from_cfg(self.cfg)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.tokenizer = getattr(self.model, "tokenizer", None)
         if self.tokenizer is None:
             raise AttributeError("Model must expose a tokenizer for inference.")
 
         self._load_weights(weights_dir, checkpoint)
-        self.model.to(self.device)
+
+        if self.device.type == "cuda":
+            if getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+                self.model_dtype = torch.bfloat16
+            else:
+                self.model_dtype = torch.float16
+        elif self.device.type == "mps":
+            self.model_dtype = torch.float16
+
+        if self.model_dtype is not None:
+            self.model = self.model.to(self.device, dtype=self.model_dtype)
+            self.autocast_kwargs = {"device_type": self.device.type, "dtype": self.model_dtype}
+        else:
+            self.model = self.model.to(self.device)
+
         self.model.eval()
 
         eval_cfg = self.cfg.get("eval", {})
@@ -129,17 +241,21 @@ class LocalResponder:
         self.top_p = float(eval_cfg.get("top_p", 0.0))
         self.greedy = bool(eval_cfg.get("greedy", False))
         self.system_prompt: Optional[str] = None
+        self._warned_missing_harmony = False
 
     def _load_weights(self, weights_dir: Optional[str], checkpoint: Optional[str]) -> None:
         if weights_dir:
             path = Path(weights_dir)
+            if isinstance(self.model, GPTOSS):
+                load_gpt_oss_weights(self.model.backbone, path, self.device)
+                return
+
             params = None
             if path.is_dir():
                 pt_path = path / "params.pt"
                 pkl_path = path / "params.pkl"
                 if pkl_path.exists():
                     import pickle
-
                     with pkl_path.open("rb") as handle:
                         params = pickle.load(handle)
                 elif pt_path.exists():
@@ -151,7 +267,6 @@ class LocalResponder:
                     params = torch.load(path, map_location="cpu", weights_only=False)
                 elif path.suffix == ".pkl":
                     import pickle
-
                     with path.open("rb") as handle:
                         params = pickle.load(handle)
                 else:
@@ -165,20 +280,125 @@ class LocalResponder:
         self.system_prompt = system_prompt.strip() if system_prompt else None
 
     def generate(self, prompt: str) -> str:
-        full_prompt = prompt
-        if self.system_prompt:
-            full_prompt = f"{self.system_prompt}\n\n{prompt}".strip()
-        return _generate(
-            self.model,
-            self.tokenizer,
-            prompt=full_prompt,
-            device=self.device,
-            max_new_tokens=self.max_new_tokens,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            greedy=self.greedy,
-        )
+        """Convenience helper that returns the full generated text."""
+        return "".join(self.generate_stream(prompt))
+
+    def generate_stream(self, prompt: str):
+        """Generate text token by token, yielding each token as it's generated."""
+        model_name = self.cfg.get("model", {}).get("name", "")
+
+        # Use Harmony formatting for GPT-OSS models if openai_harmony is available
+        if model_name == "gpt_oss" and HARMONY_AVAILABLE:
+            # Use official Harmony library
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+            # Build conversation with system and user messages
+            messages = []
+            if self.system_prompt:
+                system_content = SystemContent.new()
+                messages.append(Message.from_role_and_content(Role.SYSTEM, system_content))
+            messages.append(Message.from_role_and_content(Role.USER, prompt))
+
+            conversation = Conversation.from_messages(messages)
+            tokens = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+
+            # Use StreamableParser to parse generated tokens
+            parser = StreamableParser(encoding, role=Role.ASSISTANT)
+
+            # Generate tokens and parse them
+            for token_id in _generate_stream(
+                self.model,
+                self.tokenizer,
+                prompt=None,  # We'll use tokens directly
+                device=self.device,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                greedy=self.greedy,
+                autocast_kwargs=self.autocast_kwargs,
+                skip_special_tokens=False,
+                input_tokens=tokens,  # Pass pre-encoded tokens
+            ):
+                # Process token through parser
+                parser.process(token_id)
+
+                # Yield content deltas (parser automatically filters structural tokens)
+                if parser.last_content_delta:
+                    yield parser.last_content_delta
+                elif parser.state == StreamState.EXPECT_START:
+                    # New message starting - this is normal, continue
+                    continue
+                else:
+                    # Debugging: yield raw decoded token if parser isn't giving us content
+                    # This helps us see what's happening
+                    token_text = self.tokenizer.decode([token_id])
+                    # Only yield if it's not a special token
+                    if token_id not in {200005, 200006, 200007, 200008}:
+                        yield token_text
+        else:
+            # Fallback when Harmony parser unavailable
+            if model_name == "gpt_oss":
+                if not HARMONY_AVAILABLE and not self._warned_missing_harmony:
+                    print("\nWarning: openai_harmony not installed. Install with: pip install openai-harmony")
+                    print("Falling back to Harmony prompt string without streaming parser.\n")
+                    self._warned_missing_harmony = True
+
+                harmony_prompt = create_simple_prompt(prompt, self.system_prompt)
+                generated_tokens: List[str] = []
+                for token_id in _generate_stream(
+                    self.model,
+                    self.tokenizer,
+                    prompt=harmony_prompt,
+                    device=self.device,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature,
+                    top_k=self.top_k,
+                    top_p=self.top_p,
+                    greedy=self.greedy,
+                    autocast_kwargs=self.autocast_kwargs,
+                    skip_special_tokens=False,
+                ):
+                    token_text = self.tokenizer.decode([token_id])
+                    generated_tokens.append(token_text)
+
+                generated_suffix = "".join(generated_tokens)
+                generated_text = harmony_prompt + generated_suffix
+                try:
+                    parsed = parse_response(generated_text)
+                    final_answer = parsed.get("final_answer") or ""
+                    if final_answer:
+                        yield final_answer
+                    else:
+                        cleaned = _strip_harmony_tokens(generated_suffix).strip()
+                        if cleaned:
+                            yield cleaned
+                except Exception:
+                    cleaned = _strip_harmony_tokens(generated_suffix).strip()
+                    if cleaned:
+                        yield cleaned
+                return
+
+            # Non-GPT-OSS fallback (standard prompt)
+            full_prompt = prompt
+            if self.system_prompt:
+                full_prompt = f"{self.system_prompt}\n\n{prompt}".strip()
+
+            for token_id in _generate_stream(
+                self.model,
+                self.tokenizer,
+                prompt=full_prompt,
+                device=self.device,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                greedy=self.greedy,
+                autocast_kwargs=self.autocast_kwargs,
+                skip_special_tokens=False,
+            ):
+                token_text = self.tokenizer.decode([token_id])
+                yield token_text
 
 
 class OpenAIResponder:
@@ -313,8 +533,10 @@ def run_model_mode(args: argparse.Namespace) -> None:
             print("Bye.")
             break
 
-        output = responder.generate(prompt)
-        print("\nOutput> ", output.strip(), "\n", sep="")
+        print("\nOutput> ", end="", flush=True)
+        for token in responder.generate_stream(prompt):
+            print(token, end="", flush=True)
+        print("\n")
 
 
 def run_agent_mode(args: argparse.Namespace) -> None:
@@ -448,8 +670,16 @@ def run_agent_mode(args: argparse.Namespace) -> None:
             print()
 
         prompt = build_prompt(question, matches, prompt_template, base_doc_id)
-        answer = responder.generate(prompt)
-        print("\nAnswer> ", answer.strip(), "\n", sep="")
+
+        # Handle streaming for LocalResponder or non-streaming for OpenAI
+        if isinstance(responder, LocalResponder):
+            print("\nAnswer> ", end="", flush=True)
+            for token in responder.generate_stream(prompt):
+                print(token, end="", flush=True)
+            print("\n")
+        else:
+            answer = responder.generate(prompt)
+            print("\nAnswer> ", answer.strip(), "\n", sep="")
 
 
 def main() -> None:

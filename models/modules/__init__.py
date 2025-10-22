@@ -5,5 +5,9 @@ from .embeddings import OutputProjection, TokenEmbedding, PositionEmbedding  # n
 from .activations import build_activation, SwiGLU  # noqa: F401
 from .losses import build_loss  # noqa: F401
 from .rope import RotaryEmbedding  # noqa: F401
-from .gqa import GroupedQueryAttention  # noqa: F401
-from .moe import MoEMLP  # noqa: F401
+from .gqa import AttentionBlock  # noqa: F401
+from .moe import MLPBlock  # noqa: F401
+
+# Backward compatibility aliases
+GroupedQueryAttention = AttentionBlock
+MoEMLP = MLPBlock
