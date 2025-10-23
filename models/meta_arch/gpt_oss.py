@@ -161,9 +161,9 @@ def load_gpt_oss_weights(model: GPTOSSBackbone, weights_path: Path, device: torc
     """Load GPT-OSS weights from HuggingFace checkpoint.
 
     Args:
-        model: Model to load weights into
+        model: Model to load weights into (should already be on target device)
         weights_path: Path to weights directory
-        device: Device to load weights on
+        device: Device to load weights on (deprecated, inferred from model)
         low_memory: If True, loads weights directly into model to save memory
     """
     print(f"Loading GPT-OSS weights from {weights_path}")
@@ -175,10 +175,12 @@ def load_gpt_oss_weights(model: GPTOSSBackbone, weights_path: Path, device: torc
         if index_file.exists():
             if low_memory:
                 # Load weights directly into model to save memory
-                _load_weights_low_memory(model, index_file, device)
+                _load_weights_low_memory(model, index_file)
             else:
                 # Traditional loading (uses more memory)
-                state_dict = load_safetensors_sharded(index_file, device)
+                # Infer device from model parameters
+                model_device = next(model.parameters()).device
+                state_dict = load_safetensors_sharded(index_file, model_device)
                 state_dict = remap_hf_to_official(state_dict)
                 missing, unexpected = model.load_state_dict(state_dict, strict=False)
                 if missing:
@@ -192,8 +194,13 @@ def load_gpt_oss_weights(model: GPTOSSBackbone, weights_path: Path, device: torc
         raise ValueError(f"Expected directory, got {weights_path}")
 
 
-def _load_weights_low_memory(model: GPTOSSBackbone, index_file: Path, device: torch.device) -> None:
-    """Load weights directly into model parameters to minimize memory usage."""
+def _load_weights_low_memory(model: GPTOSSBackbone, index_file: Path) -> None:
+    """Load weights directly into model parameters to minimize memory usage.
+
+    Args:
+        model: Model to load weights into (should already be on target device)
+        index_file: Path to the safetensors index JSON file
+    """
     import json
     import torch
     from safetensors import safe_open
@@ -269,7 +276,9 @@ def _load_weights_low_memory(model: GPTOSSBackbone, index_file: Path, device: to
                 # Copy tensor into model parameter
                 param = model_params[official_key]
                 if tensor.shape == param.shape:
-                    param.data.copy_(tensor.to(device))
+                    # Move tensor to the same device and dtype as the parameter
+                    # This is critical for CUDA compatibility
+                    param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
                     loaded_count += 1
                 else:
                     print(f"  Warning: Shape mismatch for {official_key}: {tensor.shape} vs {param.shape}")

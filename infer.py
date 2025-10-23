@@ -216,8 +216,7 @@ class LocalResponder:
         if self.tokenizer is None:
             raise AttributeError("Model must expose a tokenizer for inference.")
 
-        self._load_weights(weights_dir, checkpoint)
-
+        # Determine dtype before loading weights
         if self.device.type == "cuda":
             if getattr(torch.cuda, "is_bf16_supported", lambda: False)():
                 self.model_dtype = torch.bfloat16
@@ -226,11 +225,15 @@ class LocalResponder:
         elif self.device.type == "mps":
             self.model_dtype = torch.float16
 
+        # Move model to device BEFORE loading weights (critical for CUDA)
         if self.model_dtype is not None:
             self.model = self.model.to(self.device, dtype=self.model_dtype)
             self.autocast_kwargs = {"device_type": self.device.type, "dtype": self.model_dtype}
         else:
             self.model = self.model.to(self.device)
+
+        # Load weights AFTER model is on the correct device
+        self._load_weights(weights_dir, checkpoint)
 
         self.model.eval()
 
