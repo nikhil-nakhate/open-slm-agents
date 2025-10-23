@@ -47,19 +47,20 @@ Requirements: Python 3.8+, PyTorch 2.0+. Optional: transformers, wandb, tensorbo
 
 Train:
 ```bash
-python train.py --mode pretraining --config base --logger none
+# Pretraining GPT-2 base from scratch
 python train.py --mode pretraining --config gpt2_base --logger tensorboard
 
-# Resume from checkpoint
-python train.py --mode pretraining --config gpt2_base --resume outputs/gpt2-base/step_200.pt
+# Supervised fine-tuning (SFT)
+python train.py --mode sft --config gpt2_base --logger tensorboard
 ```
 
-Evaluate (interactive REPL):
+Inference:
 ```bash
-python eval.py --config gpt2_base
-# Optional
-python eval.py --config gpt2_base --checkpoint outputs/gpt2-base/step_200.pt
-python eval.py --config gpt2_base --weights_dir weights/gpt2/355M
+# From trained checkpoint
+python infer.py --config configs/models/gpt2_base.yaml --checkpoint outputs/gpt2-base/checkpoint.pt
+
+# From pretrained weights (e.g., GPT-2)
+python infer.py --config configs/models/gpt2_base.yaml --weights_dir weights/gpt2/355M
 ```
 
 Generation settings are read from the `eval` section of your config.
@@ -118,6 +119,66 @@ Notes:
 - `model.modules.transformer.dim/n_layers/n_heads` are the single source of truth.
 - `vocab_size` is inferred from the tokenizer if omitted.
 - Per‑module `freeze: true` is respected at build time (no trainer logic needed).
+
+---
+
+## 🤖 Agent Configuration
+
+Build RAG agents with document ingestion and retrieval-augmented generation:
+
+```yaml
+agent:
+  name: nutrition_assistant
+  data_source:
+    type: pdf                              # pdf, txt, or json
+    path: data/datasets/rag
+  doc_id: nutrition-{name}                 # unique doc identifier
+
+  # Vector store (Supabase)
+  supabase:
+    table: chunks
+    match_fn: match_documents
+    match_count: 3                         # number of chunks to retrieve
+
+  # Chunking strategy
+  chunker:
+    strategy: fixed
+    params:
+      chunk_mode: sentence                 # sentence or token
+      sents_per_chunk: 20
+      sentence_overlap: 2
+      max_tokens: 1300
+
+  # Embedding model
+  embed_model:
+    model_zoo_id: openai/text-embedding-3-small
+    provider: openai
+
+  # Generation model (local or OpenAI)
+  model:
+    config_name: gpt2_base                 # use local model
+    # model_zoo_id: openai/gpt-4o-mini    # or use OpenAI
+    # provider: openai
+
+  # Inference settings
+  inference:
+    system_prompt: "You are a helpful assistant..."
+    prompt_template: |
+      Context: {context}
+      Question: {question}
+      Answer:
+```
+
+**Usage:**
+```bash
+# Ingest documents
+python ingest.py --config configs/agents/nutrition_chat.yaml
+
+# Run interactive QA
+python infer.py --config configs/agents/nutrition_chat.yaml
+```
+
+See `configs/agents/` for example configurations.
 
 ---
 
@@ -219,29 +280,28 @@ python eval.py --config gpt2_base --weights_dir weights/gpt2/355M
 
 The loader maps GPT‑2 tensors into our module layout (token/pos embeddings, QKV, MLP, norms, head).
 
-### GPT-OSS 20B Official Weights
-
-Load the official GPT-OSS weights from OpenAI's HuggingFace repository and run them through the refactored modular implementation:
+### GPT-OSS 20B
 
 ```bash
-# Set your HuggingFace token in .env first
-echo "HUGGINGFACE_TOKEN=your_token_here" >> .env
+# 1. Download weights from HuggingFace (requires token for private repos)
+python scripts/load_gpt_oss_weights.py \
+  --repo-id openai/gpt-oss-20b \
+  --output-dir weights/gpt-oss-20b
 
-# Download the safetensors checkpoint
-python scripts/load_gpt_oss_weights.py --repo-id openai/gpt-oss-20b --output-dir weights/gpt-oss-20b
+# 2. Run inference (CPU or GPU)
+python infer.py --config configs/models/gpt_oss.yaml
 
-# Update configs/models/gpt_oss_20b.yaml and point `model.weights`
-# to the directory that now contains model.safetensors, then run:
-python infer.py --config configs/models/gpt_oss_20b.yaml
+# 3. Test weight loading
+python test_weight_loading.py
 ```
 
-**Features:**
-- 21B parameters (3.6B active with MoE)
-- Mixture of Experts with 32 experts, top-4 routing
-- Grouped Query Attention (64 heads, 8 KV heads)
-- RoPE with YaRN scaling for extended context (131K tokens)
-- Sliding window attention (128 tokens on alternating layers)
-- MXFP4 quantized weights for efficient inference
+**Model specs:**
+- 20.9B parameters (bfloat16)
+- MoE: 32 experts, top-4 routing
+- GQA: 64 heads, 8 KV heads
+- Context: 131K tokens (YaRN RoPE)
+- Quantization: MXFP4 expert weights (auto-dequantized)
+- Memory: ~40GB loaded, works on 17GB VRAM with low-memory mode
 
 ---
 
