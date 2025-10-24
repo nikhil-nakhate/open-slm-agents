@@ -79,3 +79,4 @@ eval:
   top_k: 40
   top_p: 0.0
   greedy: false
+  prompt_format: alpaca  # Use alpaca format for instruction-tuned models

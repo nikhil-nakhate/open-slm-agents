@@ -22,6 +22,7 @@ from ops.config import load_config
 from scripts.load_gpt_weights import load_weights_into_gpt
 from models.meta_arch.gpt_oss import GPTOSS, load_gpt_oss_weights
 from ops.harmony import create_simple_prompt, parse_response
+from ops.alpaca import format_alpaca_prompt, extract_alpaca_response
 
 # Try to import openai_harmony for proper GPT-OSS inference
 try:
@@ -254,6 +255,10 @@ class LocalResponder:
         self.system_prompt: Optional[str] = None
         self._warned_missing_harmony = False
 
+        # Read prompt format from config - the config determines what format to use
+        # Each model config should specify the format it was trained with
+        self.prompt_format = eval_cfg.get("prompt_format", None)
+
     def _load_weights(self, weights_dir: Optional[str], checkpoint: Optional[str]) -> None:
         """Load weights from external source (overrides config weights if provided)."""
         if weights_dir:
@@ -307,11 +312,12 @@ class LocalResponder:
 
     def generate_stream(self, prompt: str):
         """Generate text token by token, yielding each token as it's generated."""
-        # Check if this is a GPT-OSS model using isinstance (robust to config changes)
-        is_gpt_oss = self._is_gpt_oss_model()
+        # Route to appropriate formatting based on config
+        # harmony: GPT-OSS models with Harmony library
+        # alpaca: Instruction-tuned models (GPT-2, etc.)
+        # None/other: Plain text generation
 
-        # GPT-OSS models require Harmony formatting
-        if is_gpt_oss and HARMONY_AVAILABLE:
+        if self.prompt_format == "harmony" and HARMONY_AVAILABLE:
             # Use official Harmony library with streaming parser
             encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
@@ -358,8 +364,8 @@ class LocalResponder:
                     if token_id not in {200005, 200006, 200007, 200008}:
                         yield token_text
 
-        elif is_gpt_oss:
-            # GPT-OSS without Harmony library - use fallback string formatting
+        elif self.prompt_format == "harmony":
+            # Harmony format without library - use fallback string formatting
             if not self._warned_missing_harmony:
                 print("\nWarning: openai_harmony not installed. Install with: pip install openai-harmony")
                 print("Falling back to Harmony prompt string without streaming parser.\n")
@@ -400,8 +406,31 @@ class LocalResponder:
                 if cleaned:
                     yield cleaned
 
+        elif self.prompt_format == "alpaca":
+            # Alpaca instruction format (for instruction-tuned models like fine-tuned GPT-2)
+            full_prompt = format_alpaca_prompt(
+                instruction=prompt,
+                input_text=None,
+                system_prompt=self.system_prompt
+            )
+            for token_id in _generate_stream(
+                self.model,
+                self.tokenizer,
+                prompt=full_prompt,
+                device=self.device,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                greedy=self.greedy,
+                autocast_kwargs=self.autocast_kwargs,
+                skip_special_tokens=False,
+            ):
+                token_text = self.tokenizer.decode([token_id])
+                yield token_text
+
         else:
-            # Standard models (GPT-2, etc.) - simple text generation
+            # Plain text generation (no formatting)
             full_prompt = prompt
             if self.system_prompt:
                 full_prompt = f"{self.system_prompt}\n\n{prompt}".strip()

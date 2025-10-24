@@ -37,3 +37,4 @@ eval:
   top_k: 0
   top_p: 0.95
   greedy: false
+  prompt_format: harmony  # GPT-OSS uses harmony format
