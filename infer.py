@@ -205,6 +205,11 @@ class LocalResponder:
         if "model" not in self.cfg:
             raise ValueError("Local responder requires a full model config under 'model'.")
 
+        # If --weights_dir is provided, remove config weights to avoid double-loading
+        if weights_dir and "weights" in self.cfg.get("model", {}):
+            print(f"Overriding config weights with --weights_dir: {weights_dir}")
+            self.cfg["model"].pop("weights")
+
         preferred_device = os.environ.get("INFER_DEVICE") or os.environ.get("DEVICE")
         self.device = _resolve_inference_device(preferred_device)
         self.model_dtype: Optional[torch.dtype] = None
@@ -217,13 +222,16 @@ class LocalResponder:
             raise AttributeError("Model must expose a tokenizer for inference.")
 
         # Determine dtype before loading weights
-        if self.device.type == "cuda":
-            if getattr(torch.cuda, "is_bf16_supported", lambda: False)():
-                self.model_dtype = torch.bfloat16
-            else:
+        # Only use reduced precision for GPT-OSS on GPU/MPS (it was trained in bfloat16)
+        # For other models (like GPT-2), use full precision to avoid numerical issues
+        if isinstance(self.model, GPTOSS):
+            if self.device.type == "cuda":
+                if getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+                    self.model_dtype = torch.bfloat16
+                else:
+                    self.model_dtype = torch.float16
+            elif self.device.type == "mps":
                 self.model_dtype = torch.float16
-        elif self.device.type == "mps":
-            self.model_dtype = torch.float16
 
         # Move model to device BEFORE loading weights (critical for CUDA)
         if self.model_dtype is not None:
@@ -247,8 +255,14 @@ class LocalResponder:
         self._warned_missing_harmony = False
 
     def _load_weights(self, weights_dir: Optional[str], checkpoint: Optional[str]) -> None:
+        """Load weights from external source (overrides config weights if provided)."""
         if weights_dir:
             path = Path(weights_dir)
+
+            # Check if path exists
+            if not path.exists():
+                raise FileNotFoundError(f"Weights path does not exist: {path.absolute()}")
+
             if isinstance(self.model, GPTOSS):
                 load_gpt_oss_weights(self.model.backbone, path, self.device)
                 return
@@ -278,6 +292,7 @@ class LocalResponder:
         elif checkpoint and Path(checkpoint).exists():
             state = torch.load(checkpoint, map_location=self.device, weights_only=False)
             self.model.load_state_dict(state["model"])
+        # If neither weights_dir nor checkpoint is provided, weights should have been loaded from config
 
     def set_system_prompt(self, system_prompt: Optional[str]) -> None:
         self.system_prompt = system_prompt.strip() if system_prompt else None
@@ -286,13 +301,18 @@ class LocalResponder:
         """Convenience helper that returns the full generated text."""
         return "".join(self.generate_stream(prompt))
 
+    def _is_gpt_oss_model(self) -> bool:
+        """Check if the current model is a GPT-OSS model."""
+        return isinstance(self.model, GPTOSS)
+
     def generate_stream(self, prompt: str):
         """Generate text token by token, yielding each token as it's generated."""
-        model_name = self.cfg.get("model", {}).get("name", "")
+        # Check if this is a GPT-OSS model using isinstance (robust to config changes)
+        is_gpt_oss = self._is_gpt_oss_model()
 
-        # Use Harmony formatting for GPT-OSS models if openai_harmony is available
-        if model_name == "gpt_oss" and HARMONY_AVAILABLE:
-            # Use official Harmony library
+        # GPT-OSS models require Harmony formatting
+        if is_gpt_oss and HARMONY_AVAILABLE:
+            # Use official Harmony library with streaming parser
             encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
             # Build conversation with system and user messages
@@ -303,7 +323,7 @@ class LocalResponder:
             messages.append(Message.from_role_and_content(Role.USER, prompt))
 
             conversation = Conversation.from_messages(messages)
-            tokens = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+            input_tokens = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
 
             # Use StreamableParser to parse generated tokens
             parser = StreamableParser(encoding, role=Role.ASSISTANT)
@@ -312,7 +332,6 @@ class LocalResponder:
             for token_id in _generate_stream(
                 self.model,
                 self.tokenizer,
-                prompt=None,  # We'll use tokens directly
                 device=self.device,
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature,
@@ -321,7 +340,7 @@ class LocalResponder:
                 greedy=self.greedy,
                 autocast_kwargs=self.autocast_kwargs,
                 skip_special_tokens=False,
-                input_tokens=tokens,  # Pass pre-encoded tokens
+                input_tokens=input_tokens,
             ):
                 # Process token through parser
                 parser.process(token_id)
@@ -334,55 +353,55 @@ class LocalResponder:
                     continue
                 else:
                     # Debugging: yield raw decoded token if parser isn't giving us content
-                    # This helps us see what's happening
                     token_text = self.tokenizer.decode([token_id])
                     # Only yield if it's not a special token
                     if token_id not in {200005, 200006, 200007, 200008}:
                         yield token_text
-        else:
-            # Fallback when Harmony parser unavailable
-            if model_name == "gpt_oss":
-                if not HARMONY_AVAILABLE and not self._warned_missing_harmony:
-                    print("\nWarning: openai_harmony not installed. Install with: pip install openai-harmony")
-                    print("Falling back to Harmony prompt string without streaming parser.\n")
-                    self._warned_missing_harmony = True
 
-                harmony_prompt = create_simple_prompt(prompt, self.system_prompt)
-                generated_tokens: List[str] = []
-                for token_id in _generate_stream(
-                    self.model,
-                    self.tokenizer,
-                    prompt=harmony_prompt,
-                    device=self.device,
-                    max_new_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_k=self.top_k,
-                    top_p=self.top_p,
-                    greedy=self.greedy,
-                    autocast_kwargs=self.autocast_kwargs,
-                    skip_special_tokens=False,
-                ):
-                    token_text = self.tokenizer.decode([token_id])
-                    generated_tokens.append(token_text)
+        elif is_gpt_oss:
+            # GPT-OSS without Harmony library - use fallback string formatting
+            if not self._warned_missing_harmony:
+                print("\nWarning: openai_harmony not installed. Install with: pip install openai-harmony")
+                print("Falling back to Harmony prompt string without streaming parser.\n")
+                self._warned_missing_harmony = True
 
-                generated_suffix = "".join(generated_tokens)
-                generated_text = harmony_prompt + generated_suffix
-                try:
-                    parsed = parse_response(generated_text)
-                    final_answer = parsed.get("final_answer") or ""
-                    if final_answer:
-                        yield final_answer
-                    else:
-                        cleaned = _strip_harmony_tokens(generated_suffix).strip()
-                        if cleaned:
-                            yield cleaned
-                except Exception:
+            harmony_prompt = create_simple_prompt(prompt, self.system_prompt)
+            generated_tokens: List[str] = []
+
+            for token_id in _generate_stream(
+                self.model,
+                self.tokenizer,
+                prompt=harmony_prompt,
+                device=self.device,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                greedy=self.greedy,
+                autocast_kwargs=self.autocast_kwargs,
+                skip_special_tokens=False,
+            ):
+                token_text = self.tokenizer.decode([token_id])
+                generated_tokens.append(token_text)
+
+            generated_suffix = "".join(generated_tokens)
+            generated_text = harmony_prompt + generated_suffix
+            try:
+                parsed = parse_response(generated_text)
+                final_answer = parsed.get("final_answer") or ""
+                if final_answer:
+                    yield final_answer
+                else:
                     cleaned = _strip_harmony_tokens(generated_suffix).strip()
                     if cleaned:
                         yield cleaned
-                return
+            except Exception:
+                cleaned = _strip_harmony_tokens(generated_suffix).strip()
+                if cleaned:
+                    yield cleaned
 
-            # Non-GPT-OSS fallback (standard prompt)
+        else:
+            # Standard models (GPT-2, etc.) - simple text generation
             full_prompt = prompt
             if self.system_prompt:
                 full_prompt = f"{self.system_prompt}\n\n{prompt}".strip()

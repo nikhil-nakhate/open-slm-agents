@@ -75,7 +75,7 @@ class SFTJsonDataset(BaseDataset):
 
     - Expects each JSON file to contain a list of records (dict).
     - A text-pair transform converts each record to (prompt, target) strings.
-    - Encodes (prompt + target) into a single list of token ids using the provided tokenizer.
+    - Encodes the FULL TEXT (prompt + target) at once to avoid tokenization boundary issues.
     """
 
     def __init__(self, cfg: Dict[str, Any], paths: List[str], transform: Callable[[Dict], Tuple[str, str]], tokenizer):
@@ -83,51 +83,59 @@ class SFTJsonDataset(BaseDataset):
         self.paths = paths
         self.transform = transform
         self.tokenizer = tokenizer
-        sequences: List[List[int]] = []
+        encoded_texts: List[List[int]] = []
         for p in self.paths:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
                     for rec in data:
                         prompt, target = self.transform(rec)
-                        ids = self.tokenizer.encode(prompt) + self.tokenizer.encode(target)
-                        sequences.append(ids)
-        self.items = sequences
+                        full_text = prompt + target
+                        full_ids = self.tokenizer.encode(full_text)
+                        encoded_texts.append(full_ids)
+        self.encoded_texts = encoded_texts
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.encoded_texts)
 
     def __getitem__(self, idx: int) -> List[int]:
-        return self.items[idx]
+        """Returns token_ids for the full instruction + response text."""
+        return self.encoded_texts[idx]
 
 
 def _sft_collate_batch(batch: List[List[int]], pad_token_id: int, ignore_index: int, allowed_max_length: int) -> Dict[str, torch.Tensor]:
-    """Custom collate function from notebook - handles instruction fine-tuning data properly."""
-    # Find the longest sequence length in this batch (+1 for added pad/eos token)
-    batch_max_length = max((len(seq) + 1) for seq in batch) if batch else 0
+    """Custom collate function.
+    Args:
+        batch: List of token_id lists (full instruction + response)
+        pad_token_id: Token ID to use for padding (typically 50256 for GPT-2)
+        ignore_index: Index to use for padding tokens in labels (typically -100)
+        allowed_max_length: Maximum sequence length
+    """
+    # Find the longest sequence in the batch (+1 for added pad/eos token)
+    batch_max_length = max(len(item) + 1 for item in batch)
 
     inputs_lst: List[torch.Tensor] = []
     targets_lst: List[torch.Tensor] = []
 
-    for seq in batch:
-        new_item = list(seq)
-        # Add an <|endoftext|>/pad token at the end
+    for item in batch:
+        new_item = item.copy() if isinstance(item, list) else item.tolist()
+        # Add an <|endoftext|> token at the end
         new_item += [pad_token_id]
         # Pad to batch max length
-        pad_len = batch_max_length - len(new_item)
-        if pad_len > 0:
-            new_item = new_item + [pad_token_id] * pad_len
+        padded = new_item + [pad_token_id] * (batch_max_length - len(new_item))
 
-        inputs = torch.tensor(new_item[:-1], dtype=torch.long)
-        targets = torch.tensor(new_item[1:], dtype=torch.long)
+        # Truncate the last token for inputs, shift +1 to the right for targets
+        inputs = torch.tensor(padded[:-1], dtype=torch.long)
+        targets = torch.tensor(padded[1:], dtype=torch.long)
 
         # Replace all but the first padding tokens in targets by ignore_index
+        # This keeps one <|endoftext|> token so the model learns when to stop
         mask = targets == pad_token_id
         indices = torch.nonzero(mask).squeeze()
-        if torch.numel(indices) > 1:
+        if indices.numel() > 1:
             targets[indices[1:]] = ignore_index
 
-        # Truncate to maximum sequence length
+        # Optionally truncate to maximum sequence length
         if allowed_max_length is not None:
             inputs = inputs[:allowed_max_length]
             targets = targets[:allowed_max_length]

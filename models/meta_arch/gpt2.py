@@ -141,7 +141,8 @@ class GPT2(nn.Module):
             raise ValueError(f"Shape mismatch. Left: {tuple(left.shape)}, Right: {tuple(right.shape)}")
         # Create a Parameter with the same dtype/device as left
         tensor = torch.as_tensor(right, dtype=left.dtype, device=left.device)
-        return torch.nn.Parameter(tensor)
+        left.data.copy_(tensor)
+        return left
 
     def load_weights_into_gpt(self, params: Dict[str, Any]):
         """Loads converted GPT-2 weights into our GPT model structure.

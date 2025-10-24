@@ -193,15 +193,19 @@ def test_model_simple(model, test_loader, device, tokenizer, max_new_tokens=256,
     model.train()
     return test_data
 
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, 
-                       eval_freq=5, eval_iter=5, start_context=None, tokenizer=None):
+def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
+                       eval_freq=5, eval_iter=5, start_context=None, tokenizer=None,
+                       save_every=100, output_dir="outputs"):
     """
     Simple training function based on the notebook's train_model_simple.
-    No bells and whistles - just basic training loop.
+    Now includes checkpoint saving.
     """
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
+
+    # Create output directory for checkpoints
+    os.makedirs(output_dir, exist_ok=True)
 
     # Main training loop
     for epoch in range(num_epochs):
@@ -214,16 +218,16 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 target_batch = batch["labels"]
             else:
                 input_batch, target_batch = batch
-                
+
             optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
-            
+
             # Forward pass
             logits = model(input_batch.to(device))
             loss = model.loss_fn(logits, target_batch.to(device))
-            
+
             loss.backward()  # Calculate loss gradients
             optimizer.step()  # Update model weights using loss gradients
-            
+
             tokens_seen += input_batch.numel()  # Returns the total number of elements (or tokens) in the input_batch.
             global_step += 1
 
@@ -237,11 +241,44 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 print(f"Ep {epoch+1} (Step {global_step:06d}): "
                       f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
 
+            # Save checkpoint atomically to prevent corruption
+            if global_step > 0 and global_step % save_every == 0:
+                checkpoint_path = os.path.join(output_dir, f"checkpoint_step_{global_step}.pt")
+                temp_path = checkpoint_path + ".tmp"
+                print(f"Saving checkpoint at step {global_step} to {checkpoint_path}")
+                torch.save({
+                    'step': global_step,
+                    'epoch': epoch,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'train_losses': train_losses,
+                    'val_losses': val_losses,
+                    'tokens_seen': tokens_seen,
+                }, temp_path)
+                # Atomic rename to prevent partial checkpoints
+                os.replace(temp_path, checkpoint_path)
+                print(f"✓ Checkpoint saved successfully")
+
         # Print a sample text after each epoch if context and tokenizer provided
         if start_context and tokenizer:
             generate_and_print_sample_simple(
                 model, tokenizer, device, start_context
             )
+
+    # Save final checkpoint atomically
+    final_checkpoint_path = os.path.join(output_dir, "checkpoint_final.pt")
+    temp_path = final_checkpoint_path + ".tmp"
+    torch.save({
+        'step': global_step,
+        'epoch': num_epochs,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'tokens_seen': tokens_seen,
+    }, temp_path)
+    os.replace(temp_path, final_checkpoint_path)
+    print(f"Saved final checkpoint to {final_checkpoint_path}")
 
     return train_losses, val_losses, track_tokens_seen
 
@@ -297,8 +334,13 @@ def generate_and_print_sample_simple(model, tokenizer, device, start_context):
         encoded = tokenizer.encode(start_context)
     else:
         encoded = start_context
-    
-    encoded = torch.tensor(encoded).unsqueeze(0).to(device)  # Add batch dimension
+
+    # Handle case where encode returns a tensor or single value
+    if isinstance(encoded, torch.Tensor):
+        encoded = encoded.unsqueeze(0).to(device) if encoded.dim() == 1 else encoded.to(device)
+    else:
+        # encoded is a list or array
+        encoded = torch.tensor(encoded).unsqueeze(0).to(device)  # Add batch dimension
     
     with torch.no_grad():
         token_ids = generate_text_simple(
@@ -441,8 +483,14 @@ def main():
     # Get a sample context for generation
     if len(val_dataset) > 0:
         sample = val_dataset[0]
+        # Handle different dataset formats
         if isinstance(sample, dict):
-            start_context = sample["input_ids"][:20]  # First 20 tokens
+            start_context = sample["input_ids"][:20]
+        elif isinstance(sample, (list, tuple)):
+            # SFT dataset returns list of token IDs directly
+            start_context = sample[:20] if isinstance(sample, list) else list(sample[:20])
+        elif isinstance(sample, torch.Tensor):
+            start_context = sample[:20].tolist()
         else:
             start_context = sample[:20]
     else:
@@ -459,14 +507,19 @@ def main():
         print(f"Test completed with {len(results)} results")
     else:
         # Training mode
-        num_epochs = 2
+        num_epochs = cfg.get("train", {}).get("num_epochs", 2)
+        save_every = cfg.get("train", {}).get("save_every", 10)
+        output_dir = cfg.get("train", {}).get("output_dir", "outputs")
+
         train_losses, val_losses, tokens_seen = train_model_simple(
             model, train_loader, val_loader, optimizer, device,
             num_epochs=num_epochs, eval_freq=5, eval_iter=5,
-            start_context=start_context, tokenizer=tokenizer
+            start_context=start_context, tokenizer=tokenizer,
+            save_every=save_every, output_dir=output_dir
         )
-        
+
         print(f"Training completed. Final train loss: {train_losses[-1]:.3f}, Final val loss: {val_losses[-1]:.3f}")
+        print(f"Processed {tokens_seen} tokens")
         
         # Optionally run test after training
         print("Running test on trained model...")

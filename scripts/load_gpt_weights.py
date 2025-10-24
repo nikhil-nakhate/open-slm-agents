@@ -75,4 +75,5 @@ def assign(left: torch.nn.Parameter, right: np.ndarray) -> torch.nn.Parameter:
         raise ValueError(f"Shape mismatch. Left: {tuple(left.shape)}, Right: {tuple(right.shape)}")
     # Create a Parameter with the same dtype/device as left
     tensor = torch.as_tensor(right, dtype=left.dtype, device=left.device)
-    return torch.nn.Parameter(tensor)
+    left.data.copy_(tensor)
+    return left
