@@ -312,6 +312,10 @@ class LocalResponder:
 
     def generate_stream(self, prompt: str):
         """Generate text token by token, yielding each token as it's generated."""
+        # Reset KV cache before new generation
+        if hasattr(self.model, 'reset_cache'):
+            self.model.reset_cache()
+
         # Route to appropriate formatting based on config
         # harmony: GPT-OSS models with Harmony library
         # alpaca: Instruction-tuned models (GPT-2, etc.)
@@ -335,6 +339,7 @@ class LocalResponder:
             parser = StreamableParser(encoding, role=Role.ASSISTANT)
 
             # Generate tokens and parse them
+            token_count = 0
             for token_id in _generate_stream(
                 self.model,
                 self.tokenizer,
@@ -348,6 +353,7 @@ class LocalResponder:
                 skip_special_tokens=False,
                 input_tokens=input_tokens,
             ):
+                token_count += 1
                 # Process token through parser
                 parser.process(token_id)
 
@@ -363,6 +369,10 @@ class LocalResponder:
                     # Only yield if it's not a special token
                     if token_id not in {200005, 200006, 200007, 200008}:
                         yield token_text
+
+            # Debug: print how many tokens were generated
+            import sys
+            print(f"\n[DEBUG: Generated {token_count} tokens total]", file=sys.stderr)
 
         elif self.prompt_format == "harmony":
             # Harmony format without library - use fallback string formatting

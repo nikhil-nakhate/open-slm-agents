@@ -1,6 +1,14 @@
+import os
+import sys
+
+# Fix for macOS mutex error with TensorBoard - must be set BEFORE importing PyTorch
+if sys.platform == "darwin":
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 import argparse
 import json
-import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List
 
@@ -8,12 +16,28 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+
 from ops.config import load_config
 from models.build import build_model_from_cfg
-from metrics import NoOpLogger
+from metrics import NoOpLogger, WandBLogger, TensorBoardLogger
 from data.dataset import build_dataset_and_collate
 from scripts.load_gpt_weights import load_weights_into_gpt
 from tqdm import tqdm
+
+
+def build_logger(logger_type: str, cfg: Dict[str, Any]):
+    """Build logger based on type specified in args or config."""
+    train_cfg = cfg.get("train", {})
+    project = train_cfg.get("project", "open-slm")
+    run_name = train_cfg.get("run_name", "training")
+
+    if logger_type == "wandb":
+        return WandBLogger(project=project, run_name=run_name, config=cfg)
+    elif logger_type == "tensorboard":
+        log_dir = train_cfg.get("log_dir", "runs")
+        return TensorBoardLogger(log_dir=log_dir, run_name=run_name)
+    else:
+        return NoOpLogger()
 
 
 
@@ -195,10 +219,10 @@ def test_model_simple(model, test_loader, device, tokenizer, max_new_tokens=256,
 
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
                        eval_freq=5, eval_iter=5, start_context=None, tokenizer=None,
-                       save_every=100, output_dir="outputs"):
+                       save_every=100, output_dir="outputs", logger=None):
     """
     Simple training function based on the notebook's train_model_simple.
-    Now includes checkpoint saving.
+    Now includes checkpoint saving and logging support.
     """
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen = [], [], []
@@ -206,6 +230,10 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
     # Create output directory for checkpoints
     os.makedirs(output_dir, exist_ok=True)
+
+    # Use NoOpLogger if none provided
+    if logger is None:
+        logger = NoOpLogger()
 
     # Main training loop
     for epoch in range(num_epochs):
@@ -240,6 +268,14 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 track_tokens_seen.append(tokens_seen)
                 print(f"Ep {epoch+1} (Step {global_step:06d}): "
                       f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+
+                # Log metrics
+                logger.log({
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "tokens_seen": tokens_seen,
+                    "epoch": epoch + 1
+                }, step=global_step)
 
             # Save checkpoint atomically to prevent corruption
             if global_step > 0 and global_step % save_every == 0:
@@ -511,12 +547,18 @@ def main():
         save_every = cfg.get("train", {}).get("save_every", 10)
         output_dir = cfg.get("train", {}).get("output_dir", "outputs")
 
+        # Build logger
+        logger = build_logger(args.logger, cfg)
+
         train_losses, val_losses, tokens_seen = train_model_simple(
             model, train_loader, val_loader, optimizer, device,
             num_epochs=num_epochs, eval_freq=5, eval_iter=5,
             start_context=start_context, tokenizer=tokenizer,
-            save_every=save_every, output_dir=output_dir
+            save_every=save_every, output_dir=output_dir, logger=logger
         )
+
+        # Close logger
+        logger.close()
 
         print(f"Training completed. Final train loss: {train_losses[-1]:.3f}, Final val loss: {val_losses[-1]:.3f}")
         print(f"Processed {tokens_seen} tokens")

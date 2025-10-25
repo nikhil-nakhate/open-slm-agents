@@ -408,6 +408,14 @@ class GPTOSS(nn.Module):
 
         return logits
 
+    def reset_cache(self):
+        """Reset KV cache in all attention layers.
+
+        Call this before starting a new generation sequence.
+        """
+        for layer in self.backbone.block:
+            layer.attn.reset_cache()
+
     @classmethod
     def from_config(cls, cfg: Dict[str, Any]) -> "GPTOSS":
         """Create model from config dictionary.

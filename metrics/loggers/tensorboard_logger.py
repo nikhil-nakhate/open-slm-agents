@@ -1,5 +1,6 @@
 from typing import Any, Dict
 import os
+import sys
 
 from .base import BaseLogger
 
@@ -7,6 +8,12 @@ from .base import BaseLogger
 class TensorBoardLogger(BaseLogger):
     def __init__(self, project: str = None, run_name: str = None, config: Dict[str, Any] = None, log_dir: str = "runs", **kwargs):
         super().__init__(project, run_name, config, **kwargs)
+
+        # Fix for macOS mutex error - set environment variables before importing TensorBoard
+        if sys.platform == "darwin":
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
+
         try:
             from torch.utils.tensorboard import SummaryWriter  # type: ignore
         except Exception as e:  # pragma: no cover - optional dependency

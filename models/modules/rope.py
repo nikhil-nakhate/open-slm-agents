@@ -104,35 +104,50 @@ class RotaryEmbedding(nn.Module):
 
         return concentration, inv_freq
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        start_pos: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply rotary embeddings to query and key tensors.
 
         Args:
             q: Query tensor [n_tokens, n_heads, (q_mult), head_dim]
             k: Key tensor [n_tokens, n_heads, head_dim]
+            start_pos: Starting position offset for KV cache (default: 0)
 
         Returns:
             Tuple of (rotated_q, rotated_k)
         """
-        num_tokens = q.shape[0]
+        num_tokens_q = q.shape[0]
+        num_tokens_k = k.shape[0]
+
         # Use the device from the input tensors to ensure everything is on the same device
         concentration, inv_freq = self._compute_concentration_and_inv_freq(q.device)
 
-        # Build position encodings
-        t = torch.arange(num_tokens, dtype=torch.float32, device=q.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = freqs.cos() * concentration
-        sin = freqs.sin() * concentration
+        # Build position encodings for Q (starting from start_pos)
+        t_q = torch.arange(start_pos, start_pos + num_tokens_q, dtype=torch.float32, device=q.device)
+        freqs_q = torch.einsum("i,j->ij", t_q, inv_freq)
+        cos_q = freqs_q.cos() * concentration
+        sin_q = freqs_q.sin() * concentration
 
-        # Apply to q and k
+        # Build position encodings for K (starting from start_pos)
+        t_k = torch.arange(start_pos, start_pos + num_tokens_k, dtype=torch.float32, device=k.device)
+        freqs_k = torch.einsum("i,j->ij", t_k, inv_freq)
+        cos_k = freqs_k.cos() * concentration
+        sin_k = freqs_k.sin() * concentration
+
+        # Apply to q
         q_shape = q.shape
-        q = q.view(num_tokens, -1, self.head_dim)
-        q = apply_rotary_emb(q, cos, sin)
+        q = q.view(num_tokens_q, -1, self.head_dim)
+        q = apply_rotary_emb(q, cos_q, sin_q)
         q = q.reshape(q_shape)
 
+        # Apply to k
         k_shape = k.shape
-        k = k.view(num_tokens, -1, self.head_dim)
-        k = apply_rotary_emb(k, cos, sin)
+        k = k.view(num_tokens_k, -1, self.head_dim)
+        k = apply_rotary_emb(k, cos_k, sin_k)
         k = k.reshape(k_shape)
 
         return q, k
